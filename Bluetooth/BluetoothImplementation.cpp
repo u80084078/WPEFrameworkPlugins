@@ -401,15 +401,17 @@ namespace Plugin {
         return true;
     }
 
-    bool BluetoothImplementation::CreateHIDDeviceNode(bdaddr_t sourceAddress, bdaddr_t destinationAddress, struct deviceInformation* hidDeviceInfo)
+    uint32_t BluetoothImplementation::CreateHIDDeviceNode(bdaddr_t sourceAddress, bdaddr_t destinationAddress, struct deviceInformation* hidDeviceInfo)
     {
         struct uhid_event uhidEvent;
         uint8_t reportDescriptor[250];
+        uint32_t uhidFD;
 
-        _uhidFD = open(UHID_PATH, O_RDWR | O_CLOEXEC);
-        if (_uhidFD < 0) {
+        uhidFD = open(UHID_PATH, O_RDWR | O_CLOEXEC);
+
+        if (uhidFD < 0) {
             TRACE(Trace::Error, ("Failed to open UHID node"));
-            return false;
+            return -1;
         }
 
         // Creating UHID Node.
@@ -427,14 +429,14 @@ namespace Plugin {
         ba2str(&sourceAddress, (char *)uhidEvent.u.create.phys);
         ba2str(&destinationAddress, (char *)uhidEvent.u.create.uniq);
 
-        if (write(_uhidFD, &uhidEvent, sizeof(uhidEvent)) < 0) {
+        if (write(uhidFD, &uhidEvent, sizeof(uhidEvent)) < 0) {
             TRACE(Trace::Error, ("Failed to create UHID node"));
-            close(_uhidFD);
-            return false;
+            close(uhidFD);
+            return -1;
         }
 
         TRACE(Trace::Information, ("Successfully created UHID node"));
-        return true;
+        return uhidFD;
     }
 
     bool BluetoothImplementation::EnableInputReportNotification(uint32_t l2capSocket)
@@ -500,27 +502,24 @@ namespace Plugin {
                         struct uhid_event uhidEvent;
                         memset(&uhidEvent, 0, sizeof(uhidEvent));
                         uhidEvent.type = UHID_INPUT;
-                        uhidEvent.u.input.size = 9;
+                        uhidEvent.u.input.size = dataLength;
                         uhidEvent.u.input.data[0] = 0x01;
                         count = 0;
                         for (ssize_t index=2; index < dataLength ; index++) {
                             if (dataBuffer[index] != 0x00) {
                                 count++;
-                                uhidEvent.u.input.data[2*count + 1] = dataBuffer[index];
+                                uhidEvent.u.input.data[count] = dataBuffer[index];
                             }
                         }
 
                         iov.iov_base = &uhidEvent;
                         iov.iov_len = sizeof(uhidEvent);
 
-                        if (writev(_uhidFD, &iov, 1) < 0)
+                        if (writev(iterator->second.uhidFD, &iov, 1) < 0)
                             TRACE(Trace::Error, ("Cannot write to UHID Node"));
                     }
                 }
             }
-
-            TRACE(Trace::Information, ("Updating Connected Device Info Map"));
-            _connectedDeviceInfoMap.erase(iterator);
 
             TRACE(Trace::Information, ("Reading Thread Finished for device : [%s]", deviceId.c_str()));
         } else
@@ -600,8 +599,9 @@ namespace Plugin {
                 return false;
             }
 
-            if (!CreateHIDDeviceNode(sourceAddress, destinationAddress, &hidDeviceInfo)) {
-               TRACE(Trace::Error, ("Failed to create HID Device node"));
+            connectedDevice.uhidFD = CreateHIDDeviceNode(sourceAddress, destinationAddress, &hidDeviceInfo);
+            if (connectedDevice.uhidFD < 0) {
+                TRACE(Trace::Error, ("Failed to create HID Device node"));
                 close(connectedDevice.l2capSocket);
                 return false;
             }
@@ -646,6 +646,20 @@ namespace Plugin {
         if (iterator != _connectedDeviceInfoMap.end()) {
             hci_disconnect(_hciSocket, iterator->second.connectionHandle, 0, SCAN_TIMEOUT);
             iterator->second.connected = false;
+
+            struct uhid_event uhidEvent;
+            memset(&uhidEvent, 0, sizeof(uhidEvent));
+            uhidEvent.type = UHID_DESTROY;
+
+            if (write(iterator->second.uhidFD, &uhidEvent, sizeof(uhidEvent)) < 0) {
+                TRACE(Trace::Error, ("Failed to destroy UHID node"));
+                close(iterator->second.uhidFD);
+                return false;
+            }
+
+            TRACE(Trace::Information, ("Updating Connected Device Info Map"));
+            _connectedDeviceInfoMap.erase(iterator);
+
             TRACE(Trace::Information, ("Disconnected BT Device. Device ID : [%s]", deviceId.c_str()));
 
             return true;

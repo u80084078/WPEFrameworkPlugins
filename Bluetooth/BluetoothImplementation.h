@@ -107,6 +107,7 @@ namespace Plugin {
         struct connectedDeviceInfo {
             uint32_t l2capSocket;
             uint32_t connectionHandle;
+            uint32_t uhidFD;
             bool connected;
         };
 
@@ -161,7 +162,7 @@ namespace Plugin {
         string ConnectedDevices();
         bool CheckForHIDProfile(uint32_t);
         bool ReadHIDDeviceInformation(uint32_t, struct deviceInformation*);
-        bool CreateHIDDeviceNode(bdaddr_t, bdaddr_t, struct deviceInformation*);
+        uint32_t CreateHIDDeviceNode(bdaddr_t, bdaddr_t, struct deviceInformation*);
         bool EnableInputReportNotification(uint32_t);
         void ReadingThread(string);
         bool SendCommand(uint32_t, uint8_t, handleRange, uint16_t, uint16_t, characteristicInfo, ssize_t, uint8_t*, uint8_t);
@@ -169,7 +170,6 @@ namespace Plugin {
     private:
         uint32_t _hciHandle;
         uint32_t _hciSocket;
-        uint32_t _uhidFD;
         std::atomic<bool> _scanning;
         std::map<string, string> _discoveredDeviceIdMap;
         std::map<string, string> _pairedDeviceIdMap;
