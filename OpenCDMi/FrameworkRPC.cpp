@@ -895,6 +895,7 @@ namespace Plugin {
                     if (factory != factories.end()) {
                         // Register this handler
                         _systemToFactory.insert(std::pair<const std::string, SystemFactory>(index.Current().Key.Value(), factory->second));
+                        TRACE_L1("Added DRM factory: %s -> %s", index.Current().Key.Value().c_str(), system.c_str());
                     }
                     else {
                         SYSLOG(PluginHost::Startup, (_T("Required factory [%s], not found for [%s]"), system.c_str(), index.Current().Key.Value().c_str()));
