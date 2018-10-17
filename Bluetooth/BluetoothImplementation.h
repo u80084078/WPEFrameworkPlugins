@@ -105,6 +105,7 @@ namespace Plugin {
         };
 
         struct connectedDeviceInfo {
+            string name;
             uint32_t l2capSocket;
             uint32_t connectionHandle;
             uint32_t uhidFD;
@@ -153,7 +154,6 @@ namespace Plugin {
         void GetDeviceName(uint8_t*, ssize_t, char*);
         void ScanningThread();
         string DiscoveredDevices();
-        bool GetPairedDevices();
         string PairedDevices();
         bool Connect(string);
         bool Disconnect(string);
@@ -166,19 +166,20 @@ namespace Plugin {
         bool EnableInputReportNotification(uint32_t);
         void ReadingThread(string);
         bool SendCommand(uint32_t, uint8_t, handleRange, uint16_t, uint16_t, characteristicInfo, ssize_t, uint8_t*, uint8_t);
+        bool PairDevice(string, uint32_t&, sockaddr_l2&);
 
     private:
         uint32_t _hciHandle;
         uint32_t _hciSocket;
         std::atomic<bool> _scanning;
         std::map<string, string> _discoveredDeviceIdMap;
-        std::map<string, string> _pairedDeviceIdMap;
-        std::map<string, connectedDeviceInfo> _connectedDeviceInfoMap;
+        std::map<string, connectedDeviceInfo> _pairedDeviceInfoMap;
+        std::map<string, string> _connectedDeviceInfoMap;
         Core::JSON::ArrayType<BTDeviceInfo> _jsonDiscoveredDevices;
         Core::JSON::ArrayType<BTDeviceInfo> _jsonPairedDevices;
         Core::JSON::ArrayType<BTDeviceInfo> _jsonConnectedDevices;
         Core::CriticalSection _scanningThreadLock;
-    };
+        };
 
 } /* namespace WPEFramework::Plugin */
 }

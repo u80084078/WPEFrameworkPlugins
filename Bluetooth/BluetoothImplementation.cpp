@@ -234,15 +234,128 @@ namespace Plugin {
         return deviceInfoList;
     }
 
-    bool BluetoothImplementation::Pair(string deviceId)
+    bool BluetoothImplementation::PairDevice(string deviceId, uint32_t& l2capSocket, sockaddr_l2& destinationSocket)
     {
 
-        TRACE(Trace::Information, ("Paired BT Device. Device ID : [%s]", deviceId.c_str()));
+        struct sockaddr_l2 sourceSocket;
+        struct bt_security btSecurity;
+        bdaddr_t sourceAddress;
+        bdaddr_t destinationAddress;
+
+        l2capSocket = socket(PF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP);
+        if (l2capSocket < 0) {
+            TRACE(Trace::Error, ("Failed to Open L2CAP Socket"));
+            return false;
+        }
+
+        memset(&sourceSocket, 0, sizeof(sourceSocket));
+        hci_devba(_hciHandle, &sourceAddress);
+        sourceSocket.l2_bdaddr = sourceAddress;
+        sourceSocket.l2_family=AF_BLUETOOTH;
+        sourceSocket.l2_cid = htobs(LE_ATT_CID);
+        sourceSocket.l2_bdaddr_type = BDADDR_LE_PUBLIC;
+
+        if (bind(l2capSocket, (sockaddr*)&sourceSocket , sizeof(sourceSocket)) < 0) {
+            TRACE(Trace::Error, ("Failed to Bind the Device [%s]", deviceId.c_str()));
+            close(l2capSocket);
+            return false;
+        }
+
+        memset(&destinationSocket, 0, sizeof(destinationSocket));
+        destinationSocket.l2_family = AF_BLUETOOTH;
+        destinationSocket.l2_psm = 0;
+        destinationSocket.l2_cid = htobs(LE_ATT_CID);
+        destinationSocket.l2_bdaddr_type = BDADDR_LE_PUBLIC;
+        str2ba(deviceId.c_str(), &destinationSocket.l2_bdaddr);
+
+        memset(&btSecurity, 0, sizeof(btSecurity));
+        btSecurity.level = BT_SECURITY_MEDIUM;
+        if (setsockopt(l2capSocket, SOL_BLUETOOTH, BT_SECURITY, &btSecurity, sizeof(btSecurity))) {
+            TRACE(Trace::Error, ("Failed to set L2CAP Security level for Device [%s]", deviceId.c_str()));
+            close(l2capSocket);
+            return false;
+        }
+
         return true;
     }
 
-    bool BluetoothImplementation::GetPairedDevices()
+    bool BluetoothImplementation::Pair(string deviceId)
     {
+        struct sockaddr_l2 destinationSocket;
+        struct l2cap_conninfo l2capConnInfo;
+        struct connectedDeviceInfo connectedDevice;
+        socklen_t l2capConnInfoLen;
+        BTDeviceInfo jsonConnectedDevice;
+        bdaddr_t sourceAddress;
+        bdaddr_t destinationAddress;
+        std::thread readingThread;
+
+        if (!PairDevice(deviceId, connectedDevice.l2capSocket, destinationSocket)) {
+            TRACE(Trace::Error, ("Failed to Pair the Device [%s]", deviceId.c_str()));
+            return false;
+        }
+
+        if (connect(connectedDevice.l2capSocket, (sockaddr*)&destinationSocket, sizeof(destinationSocket)) != 0) {
+            TRACE(Trace::Error, ("Failed to Connect the Device [%s]", deviceId.c_str()));
+            close(connectedDevice.l2capSocket);
+            return false;
+        }
+
+        connectedDevice.connected = true;
+
+        l2capConnInfoLen = sizeof(l2capConnInfo);
+        getsockopt(connectedDevice.l2capSocket, SOL_L2CAP, L2CAP_CONNINFO, &l2capConnInfo, &l2capConnInfoLen);
+        TRACE(Trace::Information, ("L2CAP Connection Handle of Device [%s] is [%d]", deviceId.c_str(), l2capConnInfo.hci_handle));
+        connectedDevice.connectionHandle = l2capConnInfo.hci_handle;
+
+        hci_devba(_hciHandle, &sourceAddress);
+        str2ba(deviceId.c_str(), &destinationAddress);
+        if (CheckForHIDProfile(connectedDevice.l2capSocket)) {
+            struct deviceInformation hidDeviceInfo;
+            memset(&hidDeviceInfo, 0, sizeof(hidDeviceInfo));
+
+            if (!ReadHIDDeviceInformation(connectedDevice.l2capSocket, &hidDeviceInfo)) {
+                TRACE(Trace::Error, ("Failed to read HID Device Information"));
+                close(connectedDevice.l2capSocket);
+                return false;
+            }
+
+            connectedDevice.uhidFD = CreateHIDDeviceNode(sourceAddress, destinationAddress, &hidDeviceInfo);
+            if (connectedDevice.uhidFD == 0) {
+                TRACE(Trace::Error, ("Failed to create HID Device node"));
+                close(connectedDevice.l2capSocket);
+                return false;
+            }
+
+            if (!EnableInputReportNotification(connectedDevice.l2capSocket)) {
+                TRACE(Trace::Error, ("Failed to enable input report notification"));
+                close(connectedDevice.l2capSocket);
+                return false;
+            }
+
+            if (_connectedDeviceInfoMap.find(deviceId.c_str()) == _connectedDeviceInfoMap.end()) {
+                connectedDevice.name = hidDeviceInfo.name;
+                _pairedDeviceInfoMap.insert(std::make_pair(deviceId.c_str(), connectedDevice));
+                _connectedDeviceInfoMap.insert(std::make_pair(deviceId.c_str(), hidDeviceInfo.name));
+                jsonConnectedDevice.Address = deviceId;
+                jsonConnectedDevice.Name = hidDeviceInfo.name;
+                _jsonPairedDevices.Add(jsonConnectedDevice);
+                _jsonConnectedDevices.Add(jsonConnectedDevice);
+            }
+
+            readingThread= std::thread(&BluetoothImplementation::ReadingThread, this, deviceId);
+            readingThread.detach();
+
+            TRACE(Trace::Information, ("Connected BT Device [%s]", deviceId.c_str()));
+            return true;
+
+        } else {
+            TRACE(Trace::Error, ("The Device [%s] doesn't support HID Profile", deviceId.c_str()));
+            close(connectedDevice.l2capSocket);
+            return false;
+        }
+
+        TRACE(Trace::Information, ("Paired BT Device. Device ID : [%s]", deviceId.c_str()));
         return true;
     }
 
@@ -369,8 +482,8 @@ namespace Plugin {
         memcpy(&deviceName, &dataBuffer[1], sizeof(deviceName));
         std::stringstream nameString;
         nameString << deviceName;
-        TRACE(Trace::Information, ("Device Name is [%s]", nameString.str()));
         deviceInfo->name = nameString.str();
+        TRACE(Trace::Information, ("Device Name is [%s]", deviceInfo->name.c_str()));
         deviceInfo->country = 0;
 
         // Getting Report Descriptor Map.
@@ -478,8 +591,8 @@ namespace Plugin {
         int dataLength;
         int count;
 
-        const auto& iterator = _connectedDeviceInfoMap.find(deviceId.c_str());
-        if (iterator != _connectedDeviceInfoMap.end()) {
+        const auto& iterator = _pairedDeviceInfoMap.find(deviceId.c_str());
+        if (iterator != _pairedDeviceInfoMap.end()) {
             pollSocket.fd = iterator->second.l2capSocket;
             pollSocket.events = POLLIN;
 
@@ -529,112 +642,55 @@ namespace Plugin {
 
     bool BluetoothImplementation::Connect(string deviceId)
     {
-        struct sockaddr_l2 destinationSocket;
-        struct sockaddr_l2 sourceSocket;
-        struct bt_security btSecurity;
         struct l2cap_conninfo l2capConnInfo;
         socklen_t l2capConnInfoLen;
-        bdaddr_t sourceAddress;
-        bdaddr_t destinationAddress;
-        struct connectedDeviceInfo connectedDevice;
         std::thread readingThread;
-        BTDeviceInfo jsonConnectedDevice;
+        struct sockaddr_l2 destinationSocket;
+        uint32_t l2capSocket;
 
-        connectedDevice.l2capSocket = socket(PF_BLUETOOTH, SOCK_SEQPACKET, BTPROTO_L2CAP);
-        if (connectedDevice.l2capSocket < 0) {
-            TRACE(Trace::Error, ("Failed to Open L2CAP Socket"));
-            return false;
-        }
+        const auto& iterator = _pairedDeviceInfoMap.find(deviceId.c_str());
+        if (iterator != _pairedDeviceInfoMap.end()) {
 
-        memset(&sourceSocket, 0, sizeof(sourceSocket));
-        hci_devba(_hciHandle, &sourceAddress);
-        sourceSocket.l2_bdaddr = sourceAddress;
-        sourceSocket.l2_family=AF_BLUETOOTH;
-        sourceSocket.l2_cid = htobs(LE_ATT_CID);
-        sourceSocket.l2_bdaddr_type = BDADDR_LE_PUBLIC;
-
-        if (bind(connectedDevice.l2capSocket, (sockaddr*)&sourceSocket , sizeof(sourceSocket)) < 0) {
-            TRACE(Trace::Error, ("Failed to Bind the Device [%s]", deviceId.c_str()));
-            close(connectedDevice.l2capSocket);
-            return false;
-        }
-
-        memset(&destinationSocket, 0, sizeof(destinationSocket));
-        destinationSocket.l2_family = AF_BLUETOOTH;
-        destinationSocket.l2_psm = 0;
-        destinationSocket.l2_cid = htobs(LE_ATT_CID);
-        destinationSocket.l2_bdaddr_type = BDADDR_LE_PUBLIC;
-        str2ba(deviceId.c_str(), &destinationSocket.l2_bdaddr);
-
-        memset(&btSecurity, 0, sizeof(btSecurity));
-        btSecurity.level = BT_SECURITY_MEDIUM;
-        if (setsockopt(connectedDevice.l2capSocket, SOL_BLUETOOTH, BT_SECURITY, &btSecurity, sizeof(btSecurity))) {
-            TRACE(Trace::Error, ("Failed to set L2CAP Security level for Device [%s]", deviceId.c_str()));
-            close(connectedDevice.l2capSocket);
-            return false;
-        }
-
-        if (connect(connectedDevice.l2capSocket, (sockaddr*)&destinationSocket, sizeof(destinationSocket)) != 0) {
-            TRACE(Trace::Error, ("Failed to Connect the Device [%s]", deviceId.c_str()));
-            close(connectedDevice.l2capSocket);
-            return false;
-        }
-
-        connectedDevice.connected = true;
-
-        l2capConnInfoLen = sizeof(l2capConnInfo);
-        getsockopt(connectedDevice.l2capSocket, SOL_L2CAP, L2CAP_CONNINFO, &l2capConnInfo, &l2capConnInfoLen);
-        TRACE(Trace::Information, ("L2CAP Connection Handle of Device [%s] is [%d]", deviceId.c_str(), l2capConnInfo.hci_handle));
-        connectedDevice.connectionHandle = l2capConnInfo.hci_handle;
-
-        str2ba(deviceId.c_str(), &destinationAddress);
-
-        if (CheckForHIDProfile(connectedDevice.l2capSocket)) {
-            struct deviceInformation hidDeviceInfo;
-            memset(&hidDeviceInfo, 0, sizeof(hidDeviceInfo));
-
-            if (!ReadHIDDeviceInformation(connectedDevice.l2capSocket, &hidDeviceInfo)) {
-                TRACE(Trace::Error, ("Failed to read HID Device Information"));
-                close(connectedDevice.l2capSocket);
+            if (!PairDevice(deviceId, l2capSocket, destinationSocket)) {
+                TRACE(Trace::Error, ("Failed to Pair the Device [%s]", deviceId.c_str()));
                 return false;
             }
 
-            connectedDevice.uhidFD = CreateHIDDeviceNode(sourceAddress, destinationAddress, &hidDeviceInfo);
-            if (connectedDevice.uhidFD < 0) {
-                TRACE(Trace::Error, ("Failed to create HID Device node"));
-                close(connectedDevice.l2capSocket);
+            if (connect(l2capSocket, (sockaddr*)&destinationSocket, sizeof(destinationSocket)) != 0) {
+                TRACE(Trace::Error, ("Failed to Connect the Device [%s]", deviceId.c_str()));
+                close(l2capSocket);
                 return false;
             }
 
-            if (!EnableInputReportNotification(connectedDevice.l2capSocket)) {
-                TRACE(Trace::Error, ("Failed to enable input report notification"));
-                close(connectedDevice.l2capSocket);
-                return false;
-            }
+            iterator->second.connected = true;
 
-            if (_connectedDeviceInfoMap.find(deviceId.c_str()) == _connectedDeviceInfoMap.end()) {
-                _connectedDeviceInfoMap.insert(std::make_pair(deviceId.c_str(), connectedDevice));
-                jsonConnectedDevice.Address = deviceId;
-                jsonConnectedDevice.Name = hidDeviceInfo.name;
-                _jsonConnectedDevices.Add(jsonConnectedDevice);
-            }
+            l2capConnInfoLen = sizeof(l2capConnInfo);
+            getsockopt(l2capSocket, SOL_L2CAP, L2CAP_CONNINFO, &l2capConnInfo, &l2capConnInfoLen);
+            TRACE(Trace::Information, ("L2CAP Connection Handle of Device [%s] is [%d]", deviceId.c_str(), l2capConnInfo.hci_handle));
+            iterator->second.connectionHandle = l2capConnInfo.hci_handle;
 
-            readingThread= std::thread(&BluetoothImplementation::ReadingThread, this, deviceId.c_str());
+            _connectedDeviceInfoMap.insert(std::make_pair(deviceId.c_str(), iterator->second.name));
+
+            readingThread= std::thread(&BluetoothImplementation::ReadingThread, this, deviceId);
             readingThread.detach();
 
-            TRACE(Trace::Information, ("Connected BT Device [%s]", deviceId.c_str()));
-            return true;
-
-        } else {
-            TRACE(Trace::Error, ("The Device [%s] doesn't support HID Profile", deviceId.c_str()));
-            close(connectedDevice.l2capSocket);
-            return false;
         }
+        return true;
     }
 
     string BluetoothImplementation::ConnectedDevices()
     {
         std::string deviceInfoList;
+        BTDeviceInfo jsonConnectedDevice;
+
+        _jsonConnectedDevices.Clear();
+        if (_connectedDeviceInfoMap.size() > 0) {
+            for (auto& connectedDevice : _connectedDeviceInfoMap) {
+                jsonConnectedDevice.Address = connectedDevice.first;
+                jsonConnectedDevice.Name = connectedDevice.second;
+                _jsonConnectedDevices.Add(jsonConnectedDevice);
+            }
+        }
 
         _jsonConnectedDevices.ToString(deviceInfoList);
         return deviceInfoList;
@@ -642,23 +698,13 @@ namespace Plugin {
 
     bool BluetoothImplementation::Disconnect(string deviceId)
     {
-        const auto& iterator = _connectedDeviceInfoMap.find(deviceId.c_str());
-        if (iterator != _connectedDeviceInfoMap.end()) {
+        const auto& iterator = _pairedDeviceInfoMap.find(deviceId.c_str());
+        if (iterator != _pairedDeviceInfoMap.end()) {
             hci_disconnect(_hciSocket, iterator->second.connectionHandle, 0, SCAN_TIMEOUT);
             iterator->second.connected = false;
-
-            struct uhid_event uhidEvent;
-            memset(&uhidEvent, 0, sizeof(uhidEvent));
-            uhidEvent.type = UHID_DESTROY;
-
-            if (write(iterator->second.uhidFD, &uhidEvent, sizeof(uhidEvent)) < 0) {
-                TRACE(Trace::Error, ("Failed to destroy UHID node"));
-                close(iterator->second.uhidFD);
-                return false;
-            }
-
+            close(iterator->second.l2capSocket);
             TRACE(Trace::Information, ("Updating Connected Device Info Map"));
-            _connectedDeviceInfoMap.erase(iterator);
+            _connectedDeviceInfoMap.erase(deviceId);
 
             TRACE(Trace::Information, ("Disconnected BT Device. Device ID : [%s]", deviceId.c_str()));
 
