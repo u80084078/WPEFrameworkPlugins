@@ -7,12 +7,6 @@ include(module) # Setup default stuff needed for the cmake framework thingy.
 
 set(PLUGIN_OPTIONS)
 
-if("${CMAKE_INSTALL_PREFIX}" STREQUAL "")
-   set(PLUGIN_LINK_OPTIONS -locdm)
-else()
-   set(PLUGIN_LINK_OPTIONS -L${CMAKE_INSTALL_PREFIX}/lib -locdm)
-endif()
-
 set(PLUGIN_SOURCES 
         Module.cpp
         OCDM.cpp
@@ -20,5 +14,9 @@ set(PLUGIN_SOURCES
         FrameworkRPC.cpp)
 
 include(default_targets) # This is a regular plugin no need to edit the defaults
+
+if(NOT ("${CMAKE_INSTALL_PREFIX}" STREQUAL ""))
+   target_link_libraries(WPEFrameworkOCDM "${CMAKE_INSTALL_PREFIX}/lib/libocdm.so")
+endif()
 
 write_config(${PLUGIN_NAME})
