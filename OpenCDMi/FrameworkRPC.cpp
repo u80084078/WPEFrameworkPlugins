@@ -463,6 +463,10 @@ namespace Plugin {
                     return _mediaKeySessionExt->GetSessionIdExt();
                 }
 
+                virtual uint16_t PlaylevelCompressedVideo() const override {
+                    return _mediaKeySessionExt->PlaylevelCompressedVideo();
+                }
+
                 BEGIN_INTERFACE_MAP(Session)
                     INTERFACE_ENTRY(::OCDM::ISession)
                     INTERFACE_RELAY(::OCDM::ISession, _mediaKeySessionExt)
