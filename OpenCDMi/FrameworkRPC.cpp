@@ -178,6 +178,7 @@ namespace Plugin {
                         : ::OCDM::DataExchange(name, defaultSize)
                         , Core::Thread(Core::Thread::DefaultStackSize(), _T("DRMSessionThread"))
                         , _mediaKeys(mediaKeys)
+                        , _mediaKeysExt(dynamic_cast<CDMi::IMediaKeySessionExt*>(mediaKeys))
                         , _sessionKey(nullptr)
                         , _sessionKeyLength(0) {
                         Core::Thread::Run();
@@ -206,20 +207,23 @@ namespace Plugin {
 
                             if (IsRunning() == true) {
                                 uint8_t keyIdLength = 0;
-				const uint8_t* keyIdData = KeyId(keyIdLength);
-                                int cr = _mediaKeys->Decrypt(
-                                    _sessionKey,
-                                    _sessionKeyLength,
-                                    nullptr,       //subsamples
-                                    0,          //number of subsamples
-                                    IVKey(),
-                                    IVKeyLength(),
-                                    Buffer(),
-                                    BytesWritten(),
-                                    &clearContentSize,
-                                    &clearContent,
-                                    keyIdLength,
-                                    keyIdData);
+                                const uint8_t* keyIdData = KeyId(keyIdLength);
+
+//                                int cr = _mediaKeys->Decrypt(
+//                                    _sessionKey,
+//                                    _sessionKeyLength,
+//                                    nullptr,       //subsamples
+//                                    0,          //number of subsamples
+//                                    IVKey(),
+//                                    IVKeyLength(),
+//                                    Buffer(),
+//                                    BytesWritten(),
+//                                    &clearContentSize,
+//                                    &clearContent,
+//                                    keyIdLength,
+//                                    keyIdData);
+                                unsigned long long byteOffset = ByteOffset();
+				                int cr = _mediaKeysExt->DecryptNetflix(IVKey(), IVKeyLength(), byteOffset, Buffer(), BytesWritten());
 
                                 if ((cr == 0) && (clearContentSize != 0)) {
                                     if (clearContentSize != BytesWritten()) {
@@ -247,6 +251,7 @@ namespace Plugin {
  
                 private:
                     CDMi::IMediaKeySession* _mediaKeys;
+                    CDMi::IMediaKeySessionExt* _mediaKeysExt;
                     uint8_t* _sessionKey;
                     uint32_t _sessionKeyLength;
                 };
@@ -846,6 +851,17 @@ namespace Plugin {
                 return _systemExt->CommitSecureStop(sessionID, sessionIDLength, serverResponse, serverResponseLength);
             }
 
+            OCDM::OCDM_RESULT CreateSystemNetflix(
+                            const std::string& readDir,
+                            const std::string& storeLocation) override
+            {
+                return _systemExt->CreateSystemNetflix(readDir, storeLocation);
+            }
+
+            OCDM::OCDM_RESULT InitSystemNetflix() override
+            {
+                return _systemExt->InitSystemNetflix();
+            }
 
             virtual void Register (::OCDM::IAccessorOCDM::INotification* callback) override {
 
