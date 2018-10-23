@@ -1,0 +1,17 @@
+{
+ "locator":"libWPEFrameworkOCDM.so",
+ "classname":"OCDM",
+ "precondition":[
+  "Provisioning"
+ ],
+ "autostart":true,
+ "configuration":{
+  "mapping":{
+   "key":"com.metrological.null",
+   "system":"Null"
+  },
+  "root":{
+   "outofprocess":false
+  }
+ }
+}
