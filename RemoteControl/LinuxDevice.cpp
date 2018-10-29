@@ -6,6 +6,8 @@
 #include <thread>
 
 #define TIMEOUT 5
+#define STOP 0
+#define START 1
 
 namespace WPEFramework {
 namespace Plugin {
@@ -13,11 +15,6 @@ namespace Plugin {
     static char Locator[] = _T("/dev/input");
 
     class LinuxDevice : public Exchange::IKeyProducer, Core::Thread {
-    public:
-        enum state {
-        STOP,
-        START
-        };
     private:
         LinuxDevice(const LinuxDevice&) = delete;
         LinuxDevice& operator=(const LinuxDevice&) = delete;
@@ -116,12 +113,13 @@ namespace Plugin {
         void TimeoutHandler()
         {
             while (true) {
-                if(GetTimerStarted()) {
-                    while(_timer.isTimeout(TIMEOUT)) {
-                        if(GetTimerStarted()) {
+                if (GetTimerStarted()) {
+                    while (_timer.isTimeout(TIMEOUT)) {
+                        if (GetTimerStarted()) {
+                            _timedOutCode = _code;
+                            _timedOutFlag = true;
                             _counter = 0;
                             _timer.stop();
-                            printf("%s:%s:%d\n",__FILE__,__func__,__LINE__);
                             _callback->KeyEvent(false, _code, Name());
                             _isReleased = true;
                         }
@@ -138,10 +136,10 @@ namespace Plugin {
         {
             return (_T("DevInput"));
         }
-            virtual void Configure(const string&)
-            {
+        virtual void Configure(const string&)
+        {
             Pair();
-                }
+        }
         virtual bool Pair()
         {
             // Make sure we are not processing anything.
@@ -293,46 +291,51 @@ namespace Plugin {
             input_event entry[16];
             int index = 0;
             int result = ::read(fd, entry, sizeof(entry));
-
             if (result > 0) {
                 while (result >= sizeof(input_event)) {
-
                     ASSERT (index < (sizeof(entry) / sizeof(input_event)));
-
-                    // If it is a KEY and it is *NOT* a repeat, send it..
-                    // Repeat gets constructed by the framework anyway.
                     if ( (entry[index].type == EV_KEY) && (entry[index].value != 2) ) {
-
-                        //const uint16_t code = entry[index].code;
-                        uint16_t code = _code;
                         _code = entry[index].code;
                         const bool pressed  = entry[index].value != 0;
-                        //TRACE(Trace::Information, (_T("Sending pressed: %s, code: 0x%04X"), (pressed ? _T("true") : _T("false")), _code));
-                        if(pressed)
-                            _counter++;
-                        else {
-                            _counter = 0;
-                            _timer.stop();
+                        if (pressed){
+                            _counter++;                     //increments _counter in case of key press
+                            if (_code == _timedOutCode){
+                                _timedOutCode = 0;
+                                _timedOutFlag = false;
+                            }
+                            if (_timedOutFlag){
+                                _timer.start();             //starting timer once in case of key press
+                                _isReleased = false;
+                            }
+                        }
+                        else if (_code != _codeToIgnore && ( _code != _timedOutCode || !_timedOutFlag)){
+                            _counter = 0;                   //set _counter as 0 for key release
+                            _timer.stop();                  //stoppped timer. ie.., set _isTimerStarted as 0.........Add _isReleased=1 also.
+                            _isReleased = true;
                         }
                         if (pressed) {
                             if (_counter == 1) {
-                                _timer.start();
+                                _codePrevious = _code;
+                                _timer.start();             //starting timer once in case of key press
                                 _isReleased = false;
                            }
                         }
-                        if (!_isReleased || (_code!=_code)) {
-                           if(_isTimerStarted && (_counter > 1)) {
-                                //_counter = 0;
-                                _timer.stop();
-                                printf("%s:%s:%d\n",__FILE__,__func__,__LINE__);
-                                _callback->KeyEvent(false, code, Name());
+                           if (_isTimerStarted && (_counter > 1) && !_isReleased && !_timedOutFlag) {
+                                _codeToIgnore = _codePrevious;
+                                _counter = 0;
+                                _timer.stop();                  //stopping timer in case of second key press
+                                _isReleased = true;
+                                _callback->KeyEvent(false, _codePrevious, Name());
+                                TRACE(Trace::Information, (_T("Sending pressed: %s, code: 0x%04X"), (_T("false")), _codePrevious));
+                                _timer.start();
+                                _isReleased = false;
+                                _callback->KeyEvent(pressed, _code, Name());
+                                TRACE(Trace::Information, (_T("Sending pressed: %s, code: 0x%04X"), (pressed ? _T("true") : _T("false")), _code));
                             }
-                            //if ((_counter ==0 || _counter == 1 )&& !_isReleased) {
-                            //if (_counter ==0 || _counter == 1 ) {
-                                printf("%s:%s:%d\n",__FILE__,__func__,__LINE__);
-                               _callback->KeyEvent(pressed, _code, Name());
-                            //}
-                        }
+                            else if (_code != _codeToIgnore && _code != _timedOutCode){
+                                _callback->KeyEvent(pressed, _code, Name());    //Sending keypress event for normal key press
+                                TRACE(Trace::Information, (_T("Sending pressed: %s, code: 0xi%04X"), (pressed ? _T("true") : _T("false")), _code));
+                            }
                     }
                     index++;
                     result -= sizeof(input_event);
@@ -344,20 +347,28 @@ namespace Plugin {
     private:
         std::vector<int> _devices;
         int _pipe[2];
-                udev_monitor* _monitor;
-                int _update;
+        udev_monitor* _monitor;
+        int _update;
         Exchange::IKeyHandler* _callback;
         Timer _timer;
         static bool _isTimerStarted;
+        static bool _timedOutFlag;
         static int _counter;
         static uint16_t _code;
+        static uint16_t _codePrevious;
+        static uint16_t _codeToIgnore;
+        static uint16_t _timedOutCode;
         static bool _isReleased;
     };
 
     static LinuxDevice* _singleton(Core::Service<LinuxDevice>::Create<LinuxDevice>());
     bool LinuxDevice::_isTimerStarted = STOP;
     bool LinuxDevice::_isReleased = false;
+    bool LinuxDevice::_timedOutFlag = false;
     int LinuxDevice::_counter = 0;
     uint16_t LinuxDevice::_code = 0;
+    uint16_t LinuxDevice::_codePrevious = 0;
+    uint16_t LinuxDevice::_timedOutCode = 0;
+    uint16_t LinuxDevice::_codeToIgnore = 0;
 }
 }
