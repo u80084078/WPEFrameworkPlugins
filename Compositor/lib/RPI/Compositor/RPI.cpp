@@ -60,7 +60,8 @@ public:
     , _service(nullptr)
     , _externalAccess()
     , _observers()
-    , _clients() {
+    , _clients()
+    , _currentClientOnTop(nullptr) {
     }
 
     ~CompositorImplementation() {
@@ -205,8 +206,12 @@ public:
     }
 
     uint32_t ToTop(const string& callsign) override {
+        if (_currentClientOnTop != nullptr) {
+            _currentClientOnTop->ChangedZOrder(-1);
+        }
         // todo correct implementation
-        return CallOnClientByCallsign(callsign, [&](Exchange::IComposition::IClient& client) { client.ChangedZOrder(0); } );
+        return CallOnClientByCallsign(callsign, [&](Exchange::IComposition::IClient& client) {
+            _currentClientOnTop = &client; client.ChangedZOrder(1); } );
     }
 
     uint32_t PutBelow(const string& callsignRelativeTo, const string& callsignToReorder) override {
@@ -312,7 +317,11 @@ private:
     // on new client
     void RecalculateZOrder(Exchange::IComposition::IClient* client) {
         ASSERT(client != nullptr);
-        client->ChangedZOrder(0);
+        if (_currentClientOnTop != nullptr) {
+            _currentClientOnTop->ChangedZOrder(-1);
+        }
+        _currentClientOnTop = client;
+        client->ChangedZOrder(1);
         client->Release();
     }
 
@@ -394,6 +403,7 @@ private:
     std::unique_ptr<ExternalAccess> _externalAccess;
     std::list<Exchange::IComposition::INotification*> _observers;
     ClientDataContainer _clients; 
+    Exchange::IComposition::IClient* _currentClientOnTop;
 };
 
 SERVICE_REGISTRATION(CompositorImplementation, 1, 0);
