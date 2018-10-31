@@ -116,26 +116,22 @@ namespace Plugin {
                 if (GetTimerStarted()) {
                     while (_timer.isTimeout(TIMEOUT) && !_flag) {
                         if (GetTimerStarted()) {
-                            if (_pressed) {
+                            if (_pressed)
                                 _timedOutCode = _code;
-                            }
-                            else {
+                            else
                                 _timedOutCode = _previousCode;
-                            }
                             _counter = 0;
                             _timer.stop();
                             _isReleased  = true;
                             _callback->KeyEvent(false, _code, Name());
                             TRACE(Trace::Information, (_T("Sending _pressed: %s, code: 0x%04X"), (_T("false")), _code));
                         }
-                        if (!_counter) {
+                        if (!_counter)
                             break;
-                        }
                     }
                 }
-                else {
+                else
                     sleep(1);
-                }
             }
         }
         virtual const TCHAR* Name() const
