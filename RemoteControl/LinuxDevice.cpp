@@ -114,17 +114,23 @@ namespace Plugin {
         {
             while (true) {
                 if (GetTimerStarted()) {
-                    while (_timer.isTimeout(TIMEOUT)) {
+                    while (_timer.isTimeout(TIMEOUT) && !_flag) {
                         if (GetTimerStarted()) {
-                            _timedOutCode = _code;
-                            _timedOutFlag = true;
+                            if (_pressed) {
+                                _timedOutCode = _code;
+                            }
+                            else {
+                                _timedOutCode = _previousCode;
+                            }
                             _counter = 0;
                             _timer.stop();
+                            _isReleased  = true;
                             _callback->KeyEvent(false, _code, Name());
-                            _isReleased = true;
+                            TRACE(Trace::Information, (_T("Sending _pressed: %s, code: 0x%04X"), (_T("false")), _code));
                         }
-                        if (!_counter)
+                        if (!_counter) {
                             break;
+                        }
                     }
                 }
                 else {
@@ -262,7 +268,7 @@ namespace Plugin {
                     }
 
 
-                        // find the devices to read from
+                        // Find the devices to read from.
                     std::vector<int>::iterator index = _devices.begin();
 
                     while (index != _devices.end()) {
@@ -296,46 +302,45 @@ namespace Plugin {
                     ASSERT (index < (sizeof(entry) / sizeof(input_event)));
                     if ( (entry[index].type == EV_KEY) && (entry[index].value != 2) ) {
                         _code = entry[index].code;
-                        const bool pressed  = entry[index].value != 0;
-                        if (pressed){
-                            _counter++;                     //increments _counter in case of key press
-                            if (_code == _timedOutCode){
-                                _timedOutCode = 0;
-                                _timedOutFlag = false;
-                            }
-                            if (_timedOutFlag){
-                                _timer.start();             //starting timer once in case of key press
-                                _isReleased = false;
-                            }
-                        }
-                        else if (_code != _codeToIgnore && ( _code != _timedOutCode || !_timedOutFlag)){
-                            _counter = 0;                   //set _counter as 0 for key release
-                            _timer.stop();                  //stoppped timer. ie.., set _isTimerStarted as 0.........Add _isReleased=1 also.
+                        _pressed  = entry[index].value != 0;
+                        // Increments _counter in case of key press.
+                        if (_pressed)
+                            _counter++;
+                        // Stopping timer in case of consecutive key press.
+                        else if ((!_pressed) && (_code == _previousCode) && (_code != _timedOutCode)) {
+                            _counter = 0;
+                            _timer.stop();
                             _isReleased = true;
                         }
-                        if (pressed) {
+                        // Starting timer once in case of key press.
+                        if (_pressed) {
                             if (_counter == 1) {
-                                _codePrevious = _code;
-                                _timer.start();             //starting timer once in case of key press
-                                _isReleased = false;
-                           }
-                        }
-                           if (_isTimerStarted && (_counter > 1) && !_isReleased && !_timedOutFlag) {
-                                _codeToIgnore = _codePrevious;
-                                _counter = 0;
-                                _timer.stop();                  //stopping timer in case of second key press
-                                _isReleased = true;
-                                _callback->KeyEvent(false, _codePrevious, Name());
-                                TRACE(Trace::Information, (_T("Sending pressed: %s, code: 0x%04X"), (_T("false")), _codePrevious));
+                                _previousCode = _code;
                                 _timer.start();
                                 _isReleased = false;
-                                _callback->KeyEvent(pressed, _code, Name());
-                                TRACE(Trace::Information, (_T("Sending pressed: %s, code: 0x%04X"), (pressed ? _T("true") : _T("false")), _code));
                             }
-                            else if (_code != _codeToIgnore && _code != _timedOutCode){
-                                _callback->KeyEvent(pressed, _code, Name());    //Sending keypress event for normal key press
-                                TRACE(Trace::Information, (_T("Sending pressed: %s, code: 0xi%04X"), (pressed ? _T("true") : _T("false")), _code));
-                            }
+                        }
+                        // Stopping timer in case of consecutive key press.
+                        if ((_isTimerStarted) && (_counter > 1) && (_pressed)) {
+                            _flag = true;
+                            _timer.stop();
+                            _isReleased = true;
+                            _callback->KeyEvent(false, _previousCode, Name());
+                            TRACE(Trace::Information, (_T("Sending _pressed: %s, code: 0x%04X"), (_T("false")), _previousCode));
+                            _timer.start();
+                            _isReleased = false;
+                            _previousCode = _code;
+                            _callback->KeyEvent(_pressed, _code, Name());
+                            TRACE(Trace::Information, (_T("Sending _pressed: %s, code: 0x%04X"), (_pressed ? _T("true") : _T("false")), _code));
+                            _flag = false;
+                        }
+                        // Sending key press/release event for normal key press or release.
+                        else if ((_pressed) || ((!_pressed) && (_code==_previousCode) && (_code!=_timedOutCode))) {
+                            _callback->KeyEvent(_pressed, _code, Name());
+                            TRACE(Trace::Information, (_T("Sending _pressed: %s, code: 0xi%04X"), (_pressed ? _T("true") : _T("false")), _code));
+                        }
+                        if ((!_pressed) && (_code==_previousCode) && (_code == _timedOutCode))
+                            _timedOutCode = 0;
                     }
                     index++;
                     result -= sizeof(input_event);
@@ -352,23 +357,16 @@ namespace Plugin {
         Exchange::IKeyHandler* _callback;
         Timer _timer;
         static bool _isTimerStarted;
-        static bool _timedOutFlag;
-        static int _counter;
-        static uint16_t _code;
-        static uint16_t _codePrevious;
-        static uint16_t _codeToIgnore;
-        static uint16_t _timedOutCode;
-        static bool _isReleased;
+        int _counter;
+        uint16_t _code;
+        uint16_t _previousCode;
+        uint16_t _timedOutCode;
+        bool _isReleased;
+        bool _flag;
+        bool _pressed;
     };
 
     static LinuxDevice* _singleton(Core::Service<LinuxDevice>::Create<LinuxDevice>());
     bool LinuxDevice::_isTimerStarted = STOP;
-    bool LinuxDevice::_isReleased = false;
-    bool LinuxDevice::_timedOutFlag = false;
-    int LinuxDevice::_counter = 0;
-    uint16_t LinuxDevice::_code = 0;
-    uint16_t LinuxDevice::_codePrevious = 0;
-    uint16_t LinuxDevice::_timedOutCode = 0;
-    uint16_t LinuxDevice::_codeToIgnore = 0;
 }
 }
