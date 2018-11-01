@@ -21,7 +21,6 @@ public:
     virtual void StopFilters() = 0;
     virtual void EitBroadcasted() = 0;
     virtual bool IsScanning() = 0;
-    virtual bool IsTSInfoPresent() = 0;
     virtual void StartTimer() = 0;
 };
 

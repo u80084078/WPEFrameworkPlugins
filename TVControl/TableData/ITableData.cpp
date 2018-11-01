@@ -34,14 +34,12 @@ ITableData::ITableData(ITableDataHandler &tableDataHandler, TVPlatform::ITVPlatf
     , _homeTS(0)
     , _clearSIDataCounter(0)
     , _dbCacheCounter(0)
-    , _isTSInfoPresent(false)
 {
     _epgDB.CreateTSTable();
     TRACE(Trace::Information, (_T("SIControl instantiation check")));
     DataQueue::GetInstance().Clear();
     TRACE(Trace::Information, (_T("SIControl parental control Init")));
     ParentalControlInit();
-    UpdateScanStatus();
 }
 
 ITableData* ITableData::_tblInstance = nullptr;
@@ -89,18 +87,6 @@ void ITableData::SetHomeTS(const uint32_t primaryFreq, const uint32_t secondaryF
 bool ITableData::IsScanning()
 {
     return (_tvPlatform->IsScanning());
-}
-
-bool ITableData::IsTSInfoPresent()
-{
-    return _isTSInfoPresent;
-}
-
-void ITableData::UpdateScanStatus()
-{
-    std::string table("TSINFO");
-    if (!_epgDB.IsTableEmpty(table))
-        _isTSInfoPresent = true;
 }
 
 ITableData::~ITableData()
@@ -330,10 +316,6 @@ uint64_t ITableData::Timed(const uint64_t scheduledTime)
 void ITableData::NotifyFrequencyListUpdate()
 {
     _tvParser->UpdateFrequencyList();
-}
-
-void ITableData::NotifyTSInfoUpdate() {
-    UpdateScanStatus();
 }
 
 void ITableData::NotifyStreamingFrequencyChange(uint32_t currentFrequency)

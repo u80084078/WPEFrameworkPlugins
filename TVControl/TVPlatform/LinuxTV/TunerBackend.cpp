@@ -33,30 +33,33 @@ namespace LinuxDVB {
 
 TvTunerBackend::TvTunerBackend(uint32_t tunerCnt, std::unique_ptr<TunerData> tunerPtr, bool isDvb)
     : _tunerData(std::move(tunerPtr))
-    , _srcTypeListPtr(nullptr)
     , _supportedSysCount(0)
     , _tunerIndex(tunerCnt)
     , _tunerCount(0)
 {
     if (isDvb)
-        _sType = DvbC;
+        _sType = SYS_DVBC_ANNEX_B;
     else
-        _sType = Atsc;
+        _sType = SYS_ATSC;
+
     InitializeSourceList();
     ConfigureTuner(_tunerIndex);
 }
 
 TvTunerBackend::~TvTunerBackend()
 {
-    _tunerData = nullptr;
-    if (_srcTypeListPtr)
-        delete _srcTypeListPtr;
-    _supportedSysCount = 0;
+    _srcTypeList.clear();
 }
 
 void TvTunerBackend::InitializeSourceList()
 {
-    GetAvailableSrcList(&_srcList);
+    // Get avaiable source list from platform.
+    if (GetSupportedSourcesTypeList() < 0) {
+        TRACE(Trace::Error, (_T("Failed to get supported source list")));
+        return;
+    }
+    // Create private list of sources.
+    GetSources();
 }
 
 void TvTunerBackend::UpdateTunerCount(uint32_t tunerCount)
@@ -87,16 +90,11 @@ void TvTunerBackend::ConfigureTuner(int32_t tunerCnt)
 
 void TvTunerBackend::SetModulation(std::string& modulation)
 {
-    struct dvbfe_handle* feHandle = OpenFE(_tunerData->tunerId);
-    if (feHandle) {
-        // Get tuner info .
-        struct dvb_frontend_info feInfo;
-        if (ioctl(feHandle->fd, FE_GET_INFO, &feInfo) == -1)
-            TRACE(Trace::Error, (_T("Unable to determine frontend type")));
-
+    DVBInfo feInfo;
+    if (OpenFE(_tunerData->adapter, _tunerData->frontend, feInfo)) {
         // Set modulation .
         if (!modulation.compare("8VSB")) {
-            if (feHandle->type == DVBFE_TYPE_ATSC && (feInfo.caps & FE_CAN_8VSB)) {
+            if (feInfo.type == FE_ATSC && (feInfo.caps & FE_CAN_8VSB)) {
                 _channel = AtscVsb; // FIXME: check and remove.
 
                 // Set the modulation.
@@ -107,17 +105,17 @@ void TvTunerBackend::SetModulation(std::string& modulation)
                 propPtr->u.data = VSB_8;
 
                 // Set the current to platform.
-                if (ioctl(feHandle->fd, FE_SET_PROPERTY, &cmdseq) == -1)
+                if (ioctl(feInfo.fd, FE_SET_PROPERTY, &cmdseq) == -1)
                     TRACE(Trace::Error, (_T("Failed to set  Srource %d at plarform "), AtscVsb));
 
                 TRACE(Trace::Information, (_T("Modulation set to 8VSB")));
                 propPtr->u.data = 0;
-                _tunerData->modulation = DVBFE_ATSC_MOD_VSB_8;
+                _tunerData->modulation = VSB_8;
             } else
                 TRACE(Trace::Information, (_T("Insufficient capability details")));
         } else
             TRACE(Trace::Information, (_T("In sufficient details")));
-        dvbfe_close(feHandle);
+        CloseFE(feInfo);
     } else
         TRACE(Trace::Error, (_T("Failed to open frontend")));
 }
@@ -132,12 +130,11 @@ void TvTunerBackend::PopulateFreq()
 
 void TvTunerBackend::GetSignalStrength(double* signalStrength)
 {
-    struct dvbfe_handle* feHandle = OpenFE(_tunerData->tunerId);
-    if (feHandle) {
-        struct dvbfe_info feInfo;
-        ioctl(feHandle->fd, FE_READ_SIGNAL_STRENGTH, &feInfo.signal_strength);
-        *signalStrength = static_cast<double>(10 * (log10(feInfo.signal_strength)) + 30);
-        dvbfe_close(feHandle);
+    DVBInfo feInfo;
+    if (OpenFE(_tunerData->adapter, _tunerData->frontend, feInfo)) {
+        ioctl(feInfo.fd, FE_READ_SIGNAL_STRENGTH, &feInfo.signalStrength);
+        *signalStrength = static_cast<double>(10 * (log10(feInfo.signalStrength)) + 30);
+        CloseFE(feInfo);
     } else
         TRACE(Trace::Error, (_T("Failed to open frontend")));
 }
@@ -271,22 +268,13 @@ uint32_t TvTunerBackend::FrequencyStep(uint32_t channel, ChannelList channelList
     }
 }
 
-void TvTunerBackend::GetAvailableSrcList(SrcTypesVector* outSourceList)
-{
-    // Get avaiable source list from platform.
-    if (GetSupportedSourcesTypeList(outSourceList) < 0)
-        TRACE(Trace::Error, (_T("Failed to get supported source list")));
-    // Create private list of sources.
-    GetSources();
-}
-
 void TvTunerBackend::GetSources()
 {
-    if (_srcTypeListPtr && _supportedSysCount) {
+    if (_srcTypeList.size() && _supportedSysCount) {
         // Read supported type list from the private list and create list of source objects.
         for (int32_t i = 0; i < _supportedSysCount; i++) {
-            if (_srcTypeListPtr[i] == _sType) {
-                std::unique_ptr<SourceBackend> sInfo = std::make_unique<SourceBackend>(_srcTypeListPtr[i], _tunerData.get());
+            if (_srcTypeList[i] == _sType) {
+                std::unique_ptr<SourceBackend> sInfo = std::make_unique<SourceBackend>(_sType, _tunerData.get());
                 _source = std::move(sInfo);
             }
         }
@@ -294,134 +282,36 @@ void TvTunerBackend::GetSources()
         TRACE(Trace::Information, (_T("Private source list already created")));
 }
 
-int32_t TvTunerBackend::GetSupportedSourcesTypeList(SrcTypesVector* outSourceTypesList)
+int32_t TvTunerBackend::GetSupportedSourcesTypeList()
 {
-    if (!(_srcTypeListPtr && _supportedSysCount)) {
+    if (!(_srcTypeList.size() && _supportedSysCount)) {
         struct dtv_property p = {.cmd = DTV_ENUM_DELSYS };
         struct dtv_properties cmdName = {.num = 1, .props = &p };
-        struct dvbfe_handle* feHandle = OpenFE(_tunerData->tunerId);
-        if (feHandle) {
-            if (ioctl(feHandle->fd, FE_GET_PROPERTY, &cmdName) == -1) {
+        DVBInfo feInfo;
+        if (OpenFE(_tunerData->adapter, _tunerData->frontend, feInfo)) {
+            if (ioctl(feInfo.fd, FE_GET_PROPERTY, &cmdName) == -1) {
                 TRACE(Trace::Error, (_T("FE_GET_PROPERTY failed")));
-                dvbfe_close(feHandle);
+                CloseFE(feInfo);
                 return -1;
             }
 
             _supportedSysCount = cmdName.props->u.buffer.len;
             TRACE(Trace::Information, (_T("Number of supported Source = %d"), _supportedSysCount));
 
-            // Create an array of Type.
-            _srcTypeListPtr = (SourceType*)new SourceType[cmdName.props->u.buffer.len];
+            for (int32_t i = 0; i < _supportedSysCount; i++)
+                _srcTypeList.push_back((fe_delivery_system_t)cmdName.props->u.buffer.data[i]);
 
-            for (int32_t i = 0; i < _supportedSysCount; i++) {
-                // Map the list to W3C spec.
-                switch (cmdName.props->u.buffer.data[i]) {
-                case SYS_DVBC_ANNEX_A:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    // FIXME: _srcTypeListPtr[i] = ;
-                    break;
-                case SYS_DVBC_ANNEX_B:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    _srcTypeListPtr[i] = DvbC;
-                    break;
-                case SYS_DVBT:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    _srcTypeListPtr[i] = DvbT;
-                    break;
-                case SYS_DSS:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    // FIXME: _srcTypeListPtr[i] = ;
-                    break;
-                case SYS_DVBS:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    _srcTypeListPtr[i] = DvbS;
-                    break;
-                case SYS_DVBS2:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    _srcTypeListPtr[i] = DvbS2;
-                    break;
-                case SYS_DVBH:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    _srcTypeListPtr[i] = DvbH;
-                    break;
-                case SYS_ISDBT:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    _srcTypeListPtr[i] = IsdbT;
-                    break;
-                case SYS_ISDBS:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    _srcTypeListPtr[i] = IsdbS;
-                    break;
-                case SYS_ISDBC:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    _srcTypeListPtr[i] = IsdbC;
-                    break;
-                case SYS_ATSC:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    _srcTypeListPtr[i] = Atsc;
-                    break;
-                case SYS_ATSCMH:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    _srcTypeListPtr[i] = AtscMH;
-                    break;
-#if DVB_API_VERSION_MINOR == 10
-                case SYS_DTMB:
-#else
-                case SYS_DMBTH:
-#endif
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    _srcTypeListPtr[i] = Dtmb;
-                    break;
-                case SYS_CMMB:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    _srcTypeListPtr[i] = Cmmb;
-                    break;
-                case SYS_DAB:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    // FIXME: _srcTypeListPtr[i] = ;
-                    break;
-                case SYS_DVBT2:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    _srcTypeListPtr[i] = DvbT2;
-                    break;
-                case SYS_TURBO:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    // FIXME _srcTypeListPtr[i] = ;
-                    break;
-                case SYS_DVBC_ANNEX_C:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    // FIXME _srcTypeListPtr[i] = ;
-                    break;
-                case SYS_UNDEFINED:
-                    TRACE(Trace::Information, (_T("STP: CASE = %d"), cmdName.props->u.buffer.data[i]));
-                    _srcTypeListPtr[i] = Undifined;
-                    break;
-                default:
-                    TRACE(Trace::Information, (_T("ST: DEFAULT")));
-                    _srcTypeListPtr[i] = Undifined;
-                    break;
-                }
-            }
-            dvbfe_close(feHandle);
+            CloseFE(feInfo);
             if (!_supportedSysCount) {
-                outSourceTypesList->length = _supportedSysCount;
-                outSourceTypesList->types = nullptr;
                 TRACE(Trace::Error, (_T("driver returned 0 supported delivery source type!")));
                 return -1;
             }
         } else {
-            outSourceTypesList->length = _supportedSysCount;
-            outSourceTypesList->types = nullptr;
             TRACE(Trace::Error, (_T("Failed to open frontend")));
             return -1;
         }
 
     }
-
-    // Update the number of supported Sources.
-    outSourceTypesList->length = _supportedSysCount;
-    // Update source type ptr.
-    outSourceTypesList->types = _srcTypeListPtr;
     return _supportedSysCount;
 }
 

@@ -2,25 +2,10 @@
 #define LINUXCOMMON_H
 
 #include <condition_variable>
-#include <fcntl.h>
 #include <fstream>
-#include <inttypes.h>
-#include <iostream>
-#include <libdvbapi/dvbfe.h>
+#include <linux/dvb/dmx.h>
 #include <linux/dvb/frontend.h>
-#include <linux/dvb/version.h>
-#include <map>
-#include <memory>
-#include <mutex>
-#include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <string>
-#include <sys/ioctl.h>
 #include <thread>
-#include <unistd.h>
-#include <vector>
 
 #define DVB_ADAPTER_SCAN 6
 
@@ -29,40 +14,21 @@ enum TunerChangedOperation {
     Removed
 };
 
-enum SourceType {
-    DvbT,
-    DvbT2,
-    DvbC,
-    DvbC2,
-    DvbS,
-    DvbS2,
-    DvbH,
-    DvbSh,
-    Atsc,
-    AtscMH,
-    IsdbT,
-    IsdbTb,
-    IsdbS,
-    IsdbC,
-    _1seg,
-    Dtmb,
-    Cmmb,
-    TDmb,
-    SDmb,
-    Undifined
-};
-
-struct dvbfe_handle {
+struct DVBInfo {
+    DVBInfo() : fd (-1) {}
     int32_t fd;
-    enum dvbfe_type type;
-    char* name;
+    enum fe_type type;
+    string name;
+    enum fe_caps caps;
+    uint16_t signalStrength;
 };
 
 struct TunerData {
     TunerData() = default;
     ~TunerData() = default;
-    std::string tunerId;
-    uint32_t modulation;
+    int32_t adapter;
+    int32_t frontend;
+    fe_modulation_t modulation;
     std::vector<uint32_t> frequency;
 };
 
@@ -138,27 +104,51 @@ enum TableId {
     TableVctCable = 0xC9, // ATSC VCT QAM (cable).
 };
 
-inline struct dvbfe_handle* OpenFE(std::string& tunerId)
+inline bool OpenFE(int32_t adapter, int32_t frontend, DVBInfo& feInfo)
 {
-    // Change id to int.
-    int32_t adapter = stoi(tunerId.substr(0, tunerId.find(":")));
-    int32_t frontend = stoi(tunerId.substr(tunerId.find(":") + 1));
-    // Open dvbFe.
-    return dvbfe_open(adapter, frontend, 0);
+    int32_t readonly = 0;
+    // Open FE.
+
+    char filename[PATH_MAX+1];
+    int fd;
+    struct dvb_frontend_info info;
+
+    int flags = O_RDWR;
+    if (readonly)
+        flags = O_RDONLY;
+
+    sprintf(filename, "/dev/dvb/adapter%i/frontend%i", adapter, frontend);
+    if ((fd = open(filename, flags)) < 0) {
+        sprintf(filename, "/dev/dvb%i.frontend%i", adapter, frontend);
+        if ((fd = open(filename, flags)) < 0)
+            return false;
+    }
+
+    if (ioctl(fd, FE_GET_INFO, &info)) {
+        close(fd);
+        return false;
+    }
+    feInfo.fd = fd;
+    feInfo.type = info.type;
+    feInfo.name.assign(info.name, sizeof(info.name));
+    feInfo.caps = info.caps;
+
+    return true;
 }
 
-struct SrcTypesVector {
-    SourceType* types;
-    uint64_t length;
-};
+inline void CloseFE(DVBInfo& feInfo)
+{
+    close(feInfo.fd);
+    feInfo.fd = -1;
+}
 
 class AtscStream
 {
 public:
     AtscStream()
         : pmtPid(0)
-        , audioPid(0)
         , videoPid(0)
+        , audioPid(0)
     {
     }
     uint16_t pmtPid;

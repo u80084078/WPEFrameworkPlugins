@@ -24,39 +24,18 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-#define crc32 crc32_func
 #include "Module.h"
-#undef crc32
 #include "SourceBackend.h"
 
-#include <libucsi/atsc/section.h>
-#include <libucsi/dvb/section.h>
+#define MICROSEC_TO_NANOSEC 1000000
 
 using namespace WPEFramework;
 
 namespace LinuxDVB {
 
-static void OnPadAdded(GstElement* element, GstPad* pad, GstElementData* data)
-{
-    const gchar* newPadType = gst_structure_get_name(gst_caps_get_structure(gst_pad_query_caps(pad, nullptr), 0));
-    GstPad* sinkPad = nullptr;
-    if (g_str_has_prefix (newPadType, "audio/x-raw"))
-        sinkPad = gst_element_get_static_pad(data->audioQueue, "sink");
-    else if (g_str_has_prefix (newPadType, "video/x-raw"))
-        sinkPad = gst_element_get_static_pad(data->videoQueue, "sink");
+AtscPSI SourceBackend::_psiData;
 
-    if (!gst_pad_is_linked(sinkPad)) {
-        g_print("Dynamic pad created, linking audioQueue/videoQueue\n");
-        GstPadLinkReturn ret = gst_pad_link(pad, sinkPad);
-        if (GST_PAD_LINK_FAILED (ret))
-            g_print ("Link failed.\n");
-        else
-            g_print ("Link succeeded.\n");
-    }
-    gst_object_unref(sinkPad);
-}
-
-SourceBackend::SourceBackend(SourceType type, TunerData* tunerData)
+SourceBackend::SourceBackend(fe_delivery_system_t type, TunerData* tunerData)
     : _sType(type)
     , _tunerData(tunerData)
     , _isScanStopped(false)
@@ -64,44 +43,19 @@ SourceBackend::SourceBackend(SourceType type, TunerData* tunerData)
     , _isRunning(true)
     , _currentTunedFrequency(0)
     , _tunerCount(0)
-    , _feHandle(nullptr)
-    , _isGstreamerInitialized(false)
+    , _isGstreamerPlayBackInitialized(false)
+    , _isGstreamerFilteringInitialized(false)
     , _sectionHandler(nullptr)
+    , _isTunerUsed(false)
 {
-    _adapter = stoi(_tunerData->tunerId.substr(0, _tunerData->tunerId.find(":")));
-    _demux = stoi(_tunerData->tunerId.substr(_tunerData->tunerId.find(":") + 1));
+    _adapter = _tunerData->adapter;
 
-    _sectionFilterThread = std::thread(&SourceBackend::SectionFilterThread, this);
-
-    if (!gst_init_check(nullptr, NULL, NULL)) {
+    if (!gst_init_check(nullptr, nullptr, nullptr)) {
         TRACE(Trace::Error, (_T("Gstreamer initialization failed.")));
         return;
     }
-    _gstData.pipeline = gst_pipeline_new("pipeline");
-    _gstData.source = gst_element_factory_make("dvbsrc", "source");
-    _gstData.decoder = gst_element_factory_make("decodebin", "decoder");
-    _gstData.audioQueue = gst_element_factory_make("queue","audioqueue");
-    _gstData.videoQueue = gst_element_factory_make("queue","videoqueue");
-    _gstData.videoConvert = gst_element_factory_make("videoconvert", "videoconv");
-    _gstData.audioConvert = gst_element_factory_make("audioconvert", "audioconv");
-    _gstData.videoSink = gst_element_factory_make("autovideosink", "videosink");
-    _gstData.audioSink = gst_element_factory_make("autoaudiosink", "audiosink");
-
-    if (!_gstData.pipeline || !_gstData.source || !_gstData.decoder || !_gstData.audioQueue || !_gstData.videoQueue || !_gstData.videoConvert
-        || !_gstData.audioConvert || !_gstData.videoSink || !_gstData.audioSink) {
-        TRACE(Trace::Error, (_T("One gstreamer element could not be created.")));
-        return;
-    }
-    gst_bin_add_many(GST_BIN(_gstData.pipeline), _gstData.source, _gstData.decoder, _gstData.audioQueue, _gstData.audioConvert, _gstData.audioSink
-        , _gstData.videoQueue, _gstData.videoConvert, _gstData.videoSink, nullptr);
-
-    if (!gst_element_link(_gstData.source, _gstData.decoder) || !gst_element_link_many(_gstData.audioQueue, _gstData.audioConvert, _gstData.audioSink, nullptr)
-        || !gst_element_link_many(_gstData.videoQueue, _gstData.videoConvert, _gstData.videoSink, nullptr)) {
-        TRACE(Trace::Error, (_T("Gstreamer link error.")));
-        return;
-    }
-    if (g_signal_connect(_gstData.decoder, "pad-added", G_CALLBACK(OnPadAdded), &_gstData) && g_signal_connect(_gstData.decoder, "pad-added", G_CALLBACK(OnPadAdded), &_gstData))
-        _isGstreamerInitialized = true;
+    _isGstreamerFilteringInitialized = FilteringInitialization();
+    _tuningTimeout = 1000 * MICROSEC_TO_NANOSEC;
 }
 
 SourceBackend::~SourceBackend()
@@ -109,95 +63,188 @@ SourceBackend::~SourceBackend()
     TRACE(Trace::Information, (_T("~SourceBackend")));
     _isRunning = false;
     _isScanInProgress = false;
-    if (_psiData.size())
-        _psiData.clear();
-    gst_object_unref(GST_OBJECT (_gstData.pipeline));
+    _psiData.clear();
+    if (_isGstreamerPlayBackInitialized) {
+        gst_object_unref(GST_OBJECT(_gstPlayBackData.pipeline));
+        if (_tunerCount == 1)
+            gst_object_unref(GST_OBJECT(_gstPlayBackData.bus));
+    }
+    if (_isGstreamerFilteringInitialized) {
+        gst_object_unref(GST_OBJECT(_gstFilteringData.pipeline));
+        gst_object_unref(GST_OBJECT(_gstFilteringData.bus));
+    }
+}
 
-    _sectionFilterMutex.lock();
-    _sectionFilterCondition.notify_all();
-    _sectionFilterMutex.unlock();
+void SourceBackend::OnBusMessage(GstBus* bus, GstMessage* message, GstFilteringData* data)
+{
+    switch (GST_MESSAGE_TYPE(message)) {
+    case GST_MESSAGE_ERROR: {
+        GError* err;
+        gchar* debug;
 
-    _sectionFilterThread.join();
-    TRACE(Trace::Information, (_T("~SourceBackend")));
+        gst_message_parse_error(message, &err, &debug);
+        g_print ("Error: %s\n", err->message);
+        g_error_free(err);
+        g_free(debug);
+        g_main_loop_quit(data->loop);
+        break;
+    }
+    case GST_MESSAGE_EOS: {
+        g_main_loop_quit(data->loop);
+        break;
+    }
+    case GST_MESSAGE_ELEMENT: {
+        GstMpegtsSection* section;
+        if ((section = gst_message_parse_mpegts_section(message))) {
+
+            switch (GST_MPEGTS_SECTION_TYPE(section)) {
+            case GST_MPEGTS_SECTION_PAT: {
+                if (data->section == GST_MPEGTS_SECTION_PAT) {
+                    GPtrArray* pat = gst_mpegts_section_get_pat(section);
+                    uint32_t len = pat->len;
+
+                    AtscPmt pmt;
+                    for (uint32_t i = 0; i < len; i++) {
+                        AtscStream stream;
+                        GstMpegtsPatProgram* patp = (GstMpegtsPatProgram*)g_ptr_array_index(pat, i);
+                        stream.pmtPid = patp->network_or_program_map_PID;
+                        pmt[patp->program_number] = stream;
+
+                    }
+                    _psiData[data->frequency] = pmt;
+                    g_ptr_array_unref(pat);
+                    gst_mpegts_section_unref(section);
+                    g_main_loop_quit(data->loop);
+                }
+                break;
+            }
+            case GST_MPEGTS_SECTION_PMT: {
+                const GstMpegtsPMT* pmt = gst_mpegts_section_get_pmt(section);
+
+                uint32_t len = pmt->streams->len;
+                for (uint32_t i = 0; i < len; i++) {
+                    GstMpegtsPMTStream* stream = (GstMpegtsPMTStream*)g_ptr_array_index(pmt->streams, i);
+                    if (stream->stream_type == 0x02)
+                        _psiData[data->frequency][section->subtable_extension].videoPid = stream->pid;
+                    std::string audioLan;
+                    for (uint32_t j = 0; j < stream->descriptors->len; j++) {
+                        GstMpegtsDescriptor* desc = (GstMpegtsDescriptor*)g_ptr_array_index(stream->descriptors, j);
+                        if (desc) {
+                            switch (desc->tag) {
+                            case GST_MTS_DESC_ISO_639_LANGUAGE:
+                                GstMpegtsISO639LanguageDescriptor* res;
+
+                                if (gst_mpegts_descriptor_parse_iso_639_language(desc, &res)) {
+                                    for (uint32_t k = 0; k < res->nb_language; k++) {
+                                        audioLan = "";
+                                        audioLan = res->language[k];
+                                        if (stream->stream_type == 0x81 && audioLan == "eng")
+                                            _psiData[data->frequency][section->subtable_extension].audioPid = stream->pid;
+
+                                    }
+                                    gst_mpegts_iso_639_language_descriptor_free(res);
+                                }
+                                break;
+                            default:
+                                break;
+                            }
+                        }
+                    }
+                    if (stream->stream_type == 0x81 && (!audioLan.size() || !_psiData[data->frequency][section->subtable_extension].audioPid))
+                        _psiData[data->frequency][section->subtable_extension].audioPid = stream->pid;
+                }
+                gst_mpegts_section_unref(section);
+                g_main_loop_quit(data->loop);
+                break;
+            }
+            case GST_MPEGTS_SECTION_ATSC_MGT:
+            case GST_MPEGTS_SECTION_ATSC_STT:
+            case GST_MPEGTS_SECTION_ATSC_TVCT:
+            case GST_MPEGTS_SECTION_ATSC_EIT: {
+                uint8_t siBuf[BUFFER_SIZE];
+                gsize data_size;
+                if (section->data) {
+                    memset(siBuf, 0, sizeof(siBuf));
+                    memcpy(siBuf + DATA_OFFSET, (uint8_t*)section, sizeof(siBuf));
+                    memcpy(siBuf, &data->frequency, 4);
+                    memcpy(siBuf + SIZE_OFFSET, &(section->section_length), 2);
+                    data->sectionHandler->SectionDataCB(std::string((const char*)siBuf, BUFFER_SIZE));
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void SourceBackend::OnPadAdded(GstElement* element, GstPad* pad, GstPlayBackData* data)
+{
+    const gchar* newPadType = gst_structure_get_name(gst_caps_get_structure(gst_pad_query_caps(pad, nullptr), 0));
+    GstPad* sinkPad = nullptr;
+    if (g_str_has_prefix(newPadType, "audio/x-raw"))
+        sinkPad = gst_element_get_static_pad(data->audioQueue, "sink");
+    else if (g_str_has_prefix(newPadType, "video/x-raw"))
+        sinkPad = gst_element_get_static_pad(data->videoQueue, "sink");
+
+    if (!gst_pad_is_linked(sinkPad)) {
+        g_print("Dynamic pad created, linking audioQueue/videoQueue\n");
+        GstPadLinkReturn ret = gst_pad_link(pad, sinkPad);
+        if (GST_PAD_LINK_FAILED(ret))
+            g_print ("Link failed.\n");
+        else
+            g_print ("Link succeeded.\n");
+    }
+    gst_object_unref(sinkPad);
 }
 
 void SourceBackend::SectionFilterThread()
 {
-    uint8_t siBuf[BUFFER_SIZE];
-    while (_isRunning) {
-        if (_pollFds.empty()) {
-            _sectionFilterMutex.lock();
-            TRACE(Trace::Information, (_T("waiting for datawriting to start")));
-            _sectionFilterCondition.wait(_sectionFilterMutex);
-            _sectionFilterMutex.unlock();
-        }
-        memset(siBuf, 0, sizeof(siBuf));
-        int32_t count = poll(_pollFds.data(), _pollFds.size(), 400);
-        if (count < 0) {
-            TRACE(Trace::Error, (_T("Poll error")));
-            break;
-        }
-        if (!count) {
-            TRACE(Trace::Information, (_T("Poll timeout")));
-            continue;
-        }
-        int32_t size;
-        for (size_t k = 0; k < _pollFds.size() && _isRunning; k++) {
-            if (_pollFds[k].revents & (POLLIN | POLLPRI)) {
-                if ((size = read(_pollFds[k].fd, siBuf + DATA_OFFSET, sizeof(siBuf))) < 0) {
-                    TRACE(Trace::Error, (_T("Error calling read()")));
-                    return;
-                }
-                memcpy(siBuf, &_currentTunedFrequency, 4);
-                memcpy(siBuf + SIZE_OFFSET, &size, 2);
-                TRACE(Trace::Information, (_T("Size = %d"), size));
-                _sectionHandler->SectionDataCB(std::string((const char*)siBuf, size));
-                break;
-            }
-        }
-    }
+    std::string pids;
+    for (auto& pid : _pidSet)
+        pids += (std::to_string(pid) + ":");
+
+    StartFiltering(_currentTunedFrequency, pids, GST_MPEGTS_SECTION_UNKNOWN);
+
+    g_main_loop_run(_gstFilteringData.loop);
+    gst_element_set_state(_gstFilteringData.pipeline, GST_STATE_NULL);
+    _sectionFilterMutex.lock();
+    _sectionFilterCondition.notify_all();
+    _sectionFilterMutex.unlock();
 }
 
 TvmRc SourceBackend::SetHomeTS(uint32_t frequency)
 {
     TRACE(Trace::Information, (_T("SetHomeTS")));
-    uint32_t modulation = _tunerData->modulation;
-    if (!_feHandle)
-        _feHandle = OpenFE(_tunerData->tunerId);
-    if (_feHandle) {
-        if (frequency != _currentTunedFrequency)
-            StopFilters();
+    if (frequency != _currentTunedFrequency)
+        StopFilters();
 
-        _currentTunedFrequency = frequency;
-        if (TuneToFrequency(frequency, modulation, _feHandle))
-            return TvmSuccess;
-    }
-    return TvmError;
+    _currentTunedFrequency = frequency;
+    return TvmSuccess;
 }
 
 TvmRc SourceBackend::StopFilter(uint16_t pid)
 {
-    uint32_t index;
-    for (auto& p : _pollFdsMap) {
-        if (pid == p.first) {
-            index = p.second;
-            TRACE(Trace::Information, (_T("Clear Pid = %d"), pid));
-            _pollFds.erase(_pollFds.begin() + index);
-            _pollFdsMap.erase(_pollFdsMap.find(pid));
-        }
+    _pidSet.erase(_pidSet.find(pid));
+    if (g_main_loop_is_running(_gstFilteringData.loop))
+        g_main_loop_quit (_gstFilteringData.loop);
+
+    if (!_isScanInProgress && !_playbackInProgress && !((_tunerCount == 1) && _isTunerUsed)) {
+        std::thread sectionFilterThread(&SourceBackend::SectionFilterThread, this);
+        sectionFilterThread.detach();
     }
 }
 
 TvmRc SourceBackend::StopFilters()
 {
-    if (_pollFds.size()) {
-        for (auto& pollFd : _pollFds) {
-            dvbdemux_stop(pollFd.fd);
-            close(pollFd.fd);
-        }
-        _pollFds.clear();
-    }
-    _pollFdsMap.clear();
+    _pidSet.clear();
+    if (g_main_loop_is_running(_gstFilteringData.loop))
+        g_main_loop_quit(_gstFilteringData.loop);
 }
 
 TvmRc SourceBackend::Tune(uint32_t frequency, uint16_t programNumber, uint16_t modulation,  TVPlatform::ITVPlatform::ITunerHandler& tunerHandler)
@@ -207,24 +254,25 @@ TvmRc SourceBackend::Tune(uint32_t frequency, uint16_t programNumber, uint16_t m
 
 TvmRc SourceBackend::StartFilter(uint16_t pid, TVPlatform::ITVPlatform::ISectionHandler* pSectionHandler)
 {
-    if (_pollFdsMap.count(pid) > 0) {
+    if (_pidSet.find(pid) != _pidSet.end()) {
         TRACE(Trace::Information, (_T("PID already exists")));
         return TvmError;
     }
-
-    struct pollfd pollFd;
-    pollFd.events = POLLIN | POLLERR |POLLPRI;
-    pollFd.fd = CreateSectionFilter(pid, 0, 0);
-    TRACE(Trace::Information, (_T("Pushed into poll Fds : pid = 0x%02x"), pid));
-    _pollFds.push_back(pollFd);
-    _pollFdsMap.insert(std::pair<uint16_t, uint32_t>(pid, (_pollFds.size() - 1)));
-
+    _pidSet.insert(pid);
     if (!_sectionHandler)
         _sectionHandler = pSectionHandler;
 
-    _sectionFilterMutex.lock();
-    _sectionFilterCondition.notify_all();
-    _sectionFilterMutex.unlock();
+    if (g_main_loop_is_running(_gstFilteringData.loop)) {
+        g_main_loop_quit (_gstFilteringData.loop);
+        _sectionFilterMutex.lock();
+        _sectionFilterCondition.wait(_sectionFilterMutex);
+        _sectionFilterMutex.unlock();
+    }
+
+    if (!_isScanInProgress && !_playbackInProgress && !((_tunerCount == 1) && _isTunerUsed)) {
+        std::thread sectionFilterThread(&SourceBackend::SectionFilterThread, this);
+        sectionFilterThread.detach();
+    }
 }
 
 TvmRc SourceBackend::StartScanning(std::vector<uint32_t> freqList, TVPlatform::ITVPlatform::ITunerHandler& tunerHandler)
@@ -266,23 +314,28 @@ std::vector<uint32_t>& SourceBackend::GetFrequencyList()
 void SourceBackend::ResumeFiltering()
 {
     TRACE(Trace::Information, (string(__FUNCTION__)));
-    if (!_pollFds.size())
+    if (!_pidSet.size())
         return;
+
     if (_currentTunedFrequency && !_playbackInProgress)
         SetHomeTS(_currentTunedFrequency); //Resetting to the last tuned channel after scan.
-    for (auto& pollFd : _pollFds)
-        dvbdemux_start(pollFd.fd);
+
+    _isTunerUsed = false;
+    std::thread sectionFilterThread(&SourceBackend::SectionFilterThread, this);
+    sectionFilterThread.detach();
     TRACE(Trace::Information, (string(__FUNCTION__)));
 }
 
 bool SourceBackend::PauseFiltering()
 {
     TRACE(Trace::Information, (string(__FUNCTION__)));
-    if (!_pollFds.size())
+    if (!_pidSet.size())
         return false;
 
-    for (auto& pollFd : _pollFds)
-        dvbdemux_stop(pollFd.fd);
+    _isTunerUsed = true;
+    if (g_main_loop_is_running(_gstFilteringData.loop))
+        g_main_loop_quit(_gstFilteringData.loop);
+
     return true;
 }
 
@@ -300,98 +353,43 @@ void SourceBackend::ScanningThread(std::vector<uint32_t> freqList, TVPlatform::I
         StopPlayBack();
         _channelNo = 0;
     }
-    if (!_feHandle) {
-        _feHandle = OpenFE(_tunerData->tunerId);
-    }
-    if (_feHandle) {
-        TRACE(Trace::Information, (string(__FUNCTION__)));
-        if (_frequencyList.size())
-            _frequencyList.clear();
+    TRACE(Trace::Information, (string(__FUNCTION__)));
+    _frequencyList.clear();
 
-        std::vector<uint32_t> frequencyList;
-        if (freqList.size())
-            frequencyList = freqList;
-        else
-            frequencyList = _tunerData->frequency;
+    std::vector<uint32_t> frequencyList;
+    if (freqList.size())
+        frequencyList = freqList;
+    else
+        frequencyList = _tunerData->frequency;
 
-        uint32_t modulation = _tunerData->modulation;
-        for (auto& frequency : frequencyList) {
-            if (TuneToFrequency(frequency, modulation, _feHandle)) {
-                TRACE(Trace::Information, (string(__FUNCTION__)));
+    for (auto& frequency : frequencyList) {
+        string pids = std::to_string(PidPat);
+        if (StartFiltering(frequency, pids, GST_MPEGTS_SECTION_PAT)) {
+            g_main_loop_run(_gstFilteringData.loop);
+            gst_element_set_state(_gstFilteringData.pipeline, GST_STATE_NULL);
+            if (_psiData[frequency].size())
                 _frequencyList.push_back(frequency);
-                switch (_sType) {
-                case Atsc:
-                case AtscMH:
-                    AtscScan(frequency, modulation);
-                    break;
-                case DvbT:
-                case DvbT2:
-                case DvbC:
-                case DvbC2:
-                case DvbS:
-                case DvbS2:
-                case DvbH:
-                case DvbSh:
-                    DvbScan();
-                    break;
-                default:
-                    TRACE(Trace::Error, (_T("Type Not supported")));
-                    break;
-                }
-            }
-            if (_isScanStopped) {
-                tunerHandler.ScanningStateChanged(Stopped);
-                break;
+
+            for (auto& program : _psiData[frequency]) {
+                pids = std::to_string(program.second.pmtPid);
+                if (StartFiltering(frequency, pids, GST_MPEGTS_SECTION_PMT))
+                    g_main_loop_run(_gstFilteringData.loop);
+                    gst_element_set_state(_gstFilteringData.pipeline, GST_STATE_NULL);
             }
         }
-        if (_isScanStopped)
-            _isScanStopped = false;
-        else
-            tunerHandler.ScanningStateChanged(Completed);
+        if (_isScanStopped) {
+            tunerHandler.ScanningStateChanged(Stopped);
+            break;
+        }
     }
+    if (_isScanStopped)
+        _isScanStopped = false;
+    else
+        tunerHandler.ScanningStateChanged(Completed);
+
     TRACE(Trace::Information, (string(__FUNCTION__)));
-    ResumeFiltering();
     _isScanInProgress = false;
-}
-
-bool SourceBackend::ProcessPMT(int32_t pmtFd, AtscStream& stream)
-{
-    int32_t size;
-    uint8_t siBuf[4096];
-
-    TRACE(Trace::Information, (string(__FUNCTION__)));
-    // Read the section.
-    if ((size = read(pmtFd, siBuf, sizeof(siBuf))) < 0)
-        return false;
-
-    TRACE(Trace::Information, (string(__FUNCTION__)));
-    // Parse section.
-    struct section* section = section_codec(siBuf, size);
-    if (!section)
-        return false;
-
-    TRACE(Trace::Information, (string(__FUNCTION__)));
-    // Parse section_ext.
-    struct section_ext* sectionExt = section_ext_decode(section, 0);
-    if (!sectionExt)
-        return false;
-
-    TRACE(Trace::Information, (string(__FUNCTION__)));
-    // Parse PMT.
-    struct mpeg_pmt_section* pmt = mpeg_pmt_section_codec(sectionExt);
-    if (!pmt)
-        return false;
-
-    TRACE(Trace::Information, (string(__FUNCTION__)));
-    struct mpeg_pmt_stream* curStream;
-    mpeg_pmt_section_streams_for_each(pmt, curStream)
-    {
-        TRACE(Trace::Information, (_T("stream_type : %x pid : %x"), curStream->stream_type, curStream->pid));
-        if ((!stream.videoPid) && (curStream->stream_type == 0X02))
-            stream.videoPid = curStream->pid;
-        if ((!stream.audioPid) && (curStream->stream_type == 0X81))
-            stream.audioPid = curStream->pid;
-    }
+    ResumeFiltering();
 }
 
 TvmRc SourceBackend::StopScanning()
@@ -400,39 +398,66 @@ TvmRc SourceBackend::StopScanning()
     return TvmSuccess;
 }
 
-bool SourceBackend::StartPlayBack(uint32_t frequency, uint32_t modulation, uint16_t pmtPid, uint16_t videoPid, uint16_t audioPid)
+bool SourceBackend::StartPlayBack(uint32_t frequency, uint32_t modulation, uint16_t pmtPid, uint16_t videoPid, uint16_t audioPid, TVPlatform::ITVPlatform::ITunerHandler& tunerHandler)
 {
     TRACE(Trace::Information, (string(__FUNCTION__)));
-    if (!_isGstreamerInitialized) {
-        TRACE(Trace::Error, (_T("Gstreamer not initialized.")));
-        return false;
+    if (!_isGstreamerPlayBackInitialized) {
+        if(!(_isGstreamerPlayBackInitialized = PlayBackInitialization())) {
+            TRACE(Trace::Error, (_T("Gstreamer not initialized.")));
+            return false;
+        }
     }
-    char pidSet[20];
+
     if ((!pmtPid)&& (!videoPid) && (!audioPid)) {
         TRACE(Trace::Error, (_T("Invalid pid cannot do playback")));
         return false;
     }
-    snprintf(pidSet, 20, "%d:%d:%d", pmtPid, videoPid, audioPid);
-    g_object_set(G_OBJECT(_gstData.source), "frequency", frequency,
+
+    std::string pidSet = std::to_string(pmtPid) + ":" + std::to_string(videoPid) + ":" + std::to_string(audioPid);
+    if (_tunerCount == 1) {
+        for (auto& pid : _pidSet)
+            pidSet += (":" + std::to_string(pid));
+    }
+    g_object_set(G_OBJECT(_gstPlayBackData.dvbSource), "frequency", frequency,
         "adapter", _adapter,
-        "delsys", 11, // delivery system : atsc
-        "modulation", 7, // modulation : 8vsb
-        "pids", pidSet, nullptr);
+        "delsys", _sType,
+        "modulation", _tunerData->modulation,
+        "pids", pidSet.c_str(), nullptr);
 
     TRACE(Trace::Information, (_T("Starting playback.")));
-    gst_element_set_state(_gstData.pipeline, GST_STATE_PLAYING);
+
+    if (_tunerCount == 1) {
+        _gstFilteringData.section = GST_MPEGTS_SECTION_UNKNOWN;
+        _gstFilteringData.frequency = frequency;
+        _gstFilteringData.sectionHandler = _sectionHandler;
+        if (_currentTunedFrequency != frequency) {
+            _currentTunedFrequency = frequency;
+            StopFilters();
+            tunerHandler.StreamingFrequencyChanged(_currentTunedFrequency);
+        }
+    }
+
+    _channelChangeState = TvmSuccess;
+    _channelChangeCompleteMutex.lock();
+    _channelChangeCompleteCondition.notify_all();
+    _channelChangeCompleteMutex.unlock();
+
     _playbackInProgress = true;
+    gst_element_set_state(_gstPlayBackData.pipeline, GST_STATE_PLAYING);
+    g_main_loop_run(_gstPlayBackData.loop);
+    gst_element_set_state(_gstPlayBackData.pipeline, GST_STATE_NULL);
     return true;
 }
 
 bool SourceBackend::StopPlayBack()
 {
-    if (!_isGstreamerInitialized) {
+    if (!_isGstreamerPlayBackInitialized) {
         TRACE(Trace::Error, (_T("Gstreamer not initialized.")));
         return false;
     }
     TRACE(Trace::Information, (_T("Stopping playback.")));
-    gst_element_set_state(_gstData.pipeline, GST_STATE_NULL);
+    if (g_main_loop_is_running(_gstPlayBackData.loop))
+        g_main_loop_quit(_gstPlayBackData.loop);
     _playbackInProgress = false;
     return true;
 }
@@ -446,6 +471,11 @@ TvmRc SourceBackend::SetCurrentChannel(uint32_t frequency, uint16_t programNumbe
     _channelChangeCompleteMutex.unlock();
     if (_channelNo !=  programNumber) {
         _channelNo = programNumber;
+        PauseFiltering();
+
+        if (_playbackInProgress)
+            StopPlayBack();
+
         std::thread th(&SourceBackend::SetCurrentChannelThread, this, frequency, programNumber, modulation, std::ref(tunerHandler));
         th.detach();
         _channelChangeCompleteMutex.lock();
@@ -465,7 +495,6 @@ bool SourceBackend::GetStreamInfo(uint32_t frequency, uint16_t programNumber, At
         auto itPMT = pmt.find(programNumber);
         if (itPMT != pmt.end()) {
             TRACE(Trace::Error, (_T("%s: Program Number %d found"), __FUNCTION__, programNumber));
-
             stream.pmtPid = itPMT->second.pmtPid;
             stream.videoPid = itPMT->second.videoPid;
             stream.audioPid = itPMT->second.audioPid;
@@ -481,235 +510,10 @@ bool SourceBackend::GetStreamInfo(uint32_t frequency, uint16_t programNumber, At
 void SourceBackend::SetCurrentChannelThread(uint32_t frequency, uint16_t programNumber, uint16_t modulation, TVPlatform::ITVPlatform::ITunerHandler& tunerHandler)
 {
     TRACE(Trace::Information, (_T("Tune to Channel(program number):: %" PRIu64 ""), _channelNo));
-    PauseFiltering();
-
-    if (_feHandle) {
-        dvbfe_close(_feHandle);
-        _feHandle = nullptr;
-    }
-
-    if (_playbackInProgress)
-        StopPlayBack();
 
     AtscStream stream;
-    if (GetStreamInfo(frequency, programNumber, stream)) {
-        if (StartPlayBack(frequency, modulation, stream.pmtPid, stream.videoPid, stream.audioPid)) {
-            _channelChangeState = TvmSuccess;
-            if (_tunerCount == 1) {
-                if (_currentTunedFrequency != frequency) {
-                    _currentTunedFrequency = frequency;
-                    StopFilters();
-                    tunerHandler.StreamingFrequencyChanged(_currentTunedFrequency);
-                } else
-                    ResumeFiltering();
-            }
-        }
-    }
-    _channelChangeCompleteMutex.lock();
-    _channelChangeCompleteCondition.notify_all();
-    _channelChangeCompleteMutex.unlock();
-}
-
-void SourceBackend::DvbScan()
-{
-}
-
-bool SourceBackend::TuneToFrequency(uint32_t frequency, uint32_t modulation, struct dvbfe_handle* feHandle)
-{
-    struct dvbfe_info feInfo;
-    dvbfe_get_info(feHandle, DVBFE_INFO_FEPARAMS, &feInfo, DVBFE_INFO_QUERYTYPE_IMMEDIATE, 0);
-
-    TRACE(Trace::Information, (string(__FUNCTION__)));
-    switch (_sType) {
-    case Atsc:
-    case AtscMH:
-        if (DVBFE_TYPE_ATSC != feInfo.type) {
-            TRACE(Trace::Error, (_T("Only ATSC frontend supported currently")));
-            return false;
-        }
-        switch (modulation) {
-        case DVBFE_ATSC_MOD_VSB_8:
-            feInfo.feparams.frequency = frequency;
-            feInfo.feparams.inversion = DVBFE_INVERSION_AUTO;
-            feInfo.feparams.u.atsc.modulation = DVBFE_ATSC_MOD_VSB_8;
-            break;
-        default:
-            TRACE(Trace::Error, (_T("Modulation not supported")));
-            return false;
-        }
-        break;
-    default:
-        TRACE(Trace::Information, (_T("Only Atsc supported")));
-        return false;
-    }
-    TRACE(Trace::Information, (_T("tuning to %u Hz, please wait..."), frequency));
-
-    if (dvbfe_set(feHandle, &feInfo.feparams, 3 * 1000)) {
-        TRACE(Trace::Error, (_T("Cannot lock to %u Hz in 3 seconds"), frequency));
-        return false;
-    }
-    TRACE(Trace::Information, (_T("tuner locked.")));
-    return true;
-}
-
-#define POLL_MAX_TIMEOUT 10
-void SourceBackend::MpegScan(uint32_t frequency)
-{
-    int32_t patFd = -1;
-    if ((patFd = CreateSectionFilter(PidPat, TablePat, 1)) < 0) {
-        TRACE(Trace::Error, (_T("Failed to create PAT section filter.")));
-        return;
-    }
-    struct pollfd pollFd;
-    pollFd.fd = patFd; // PAT
-    pollFd.events = POLLIN | POLLPRI | POLLERR;
-    bool flag = true;
-    int32_t timeout = 0;
-
-    while (flag && (timeout < POLL_MAX_TIMEOUT)) {
-        int32_t count = poll(&pollFd, 1, 100);
-        if (!count) {
-            TRACE(Trace::Information, (_T("Poll fd status pollFd = %d"), pollFd.revents));
-            timeout++;
-            continue;
-        }
-
-        timeout = 0;
-        if (count < 0) {
-            TRACE(Trace::Error, (_T("Poll error")));
-            break;
-        }
-        if (pollFd.revents & (POLLIN | POLLPRI))  {
-            TRACE(Trace::Information, (_T("Got PAT data parse it")));
-            if (ProcessPAT(frequency, pollFd.fd)) {
-                flag = false;
-            } else
-                TRACE(Trace::Error, (_T("Failed to get PAT data")));
-        }
-    }
-    if (patFd != -1) {
-        dvbdemux_stop(patFd);
-        close(patFd);
-    }
-}
-
-void SourceBackend::AtscScan(uint32_t frequency, uint32_t modulation)
-{
-    switch (modulation) {
-    case DVBFE_ATSC_MOD_VSB_8:
-        if (!PopulateChannelData(frequency))
-            TRACE(Trace::Error, (_T("Failed to populate channel data")));
-        break;
-    default:
-        TRACE(Trace::Error, (_T("Modulation not supported")));
-        return;
-    }
-}
-
-bool SourceBackend::PopulateChannelData(uint32_t frequency)
-{
-    MpegScan(frequency);
-    return true;
-}
-
-int32_t SourceBackend::CreateSectionFilter(uint16_t pid, uint8_t tableId, bool isMpegTable)
-{
-    int32_t demuxFd = -1;
-
-    // Open the demuxer.
-    if ((demuxFd = dvbdemux_open_demux(_adapter, _demux, 0)) < 0)
-        return -1;
-
-    // Create a section filter.
-    uint8_t filter[18];
-    memset(filter, 0, sizeof(filter));
-    uint8_t mask[18];
-    memset(mask, 0, sizeof(mask));
-    if (isMpegTable) {
-        filter[0] = tableId;
-        mask[0] = 0xFF;
-    } else {
-        filter[0] = 0xC0;
-        mask[0] = 0xF0;
-    }
-    if (dvbdemux_set_buffer(demuxFd, 1024 * 1024))
-        TRACE(Trace::Error, (_T("Set demux buffer size failed")));
-
-    if (dvbdemux_set_section_filter(demuxFd, pid, filter, mask, 1, 0)) {
-        close(demuxFd);
-        return -1;
-    }
-    return demuxFd;
-}
-
-bool SourceBackend::ProcessPAT(uint32_t frequency, int32_t patFd)
-{
-    int32_t size;
-    uint8_t siBuf[4096];
-    struct pollfd pollfd;
-
-    TRACE(Trace::Information, (string(__FUNCTION__)));
-    // Read the section.
-    if ((size = read(patFd, siBuf, sizeof(siBuf))) < 0)
-        return false;
-
-    TRACE(Trace::Information, (string(__FUNCTION__)));
-    // Parse section.
-    struct section* section = section_codec(siBuf, size);
-    if (!section)
-        return false;
-
-    TRACE(Trace::Information, (string(__FUNCTION__)));
-    // Parse sectionExt.
-    struct section_ext* sectionExt = section_ext_decode(section, 0);
-    if (!sectionExt)
-        return false;
-
-    TRACE(Trace::Information, (string(__FUNCTION__)));
-    // Parse PAT.
-    struct mpeg_pat_section* pat = mpeg_pat_section_codec(sectionExt);
-    if (!pat)
-        return false;
-
-    TRACE(Trace::Information, (string(__FUNCTION__)));
-    // Try and find the requested program.
-    struct mpeg_pat_program* curProgram;
-    int32_t pmtFd = -1;
-    AtscPmt pmt;
-    mpeg_pat_section_programs_for_each(pat, curProgram)
-    {
-        TRACE(Trace::Information, (_T("Program Number:- %d PMT Pid:- %u frequency  :- %d"), curProgram->program_number, curProgram->pid, frequency));
-        if ((pmtFd = CreateSectionFilter(curProgram->pid, TablePmt, 1)) < 0)
-            return false;
-        pollfd.fd = pmtFd;
-        pollfd.events = POLLIN | POLLPRI | POLLERR |POLLHUP | POLLNVAL;
-        bool pmtOk = false;
-        AtscStream stream;
-        stream.pmtPid = curProgram->pid;
-        while (!pmtOk) {
-            int32_t count = poll(&pollfd, 1, 100);
-            if (count < 0) {
-                TRACE(Trace::Error, (_T("Poll error")));
-                break;
-            }
-            if (!count) {
-                TRACE(Trace::Information, (_T("Poll fd status dmxfd  timeout")));
-                continue;
-            }
-            if (pollfd.revents & (POLLIN | POLLPRI)) {
-                ProcessPMT(pollfd.fd, stream); // FIXME:PMT updation to be taken care of.
-                pmtOk = true;
-            }
-        }
-        pmt[curProgram->program_number] = stream;
-        if (pmtFd != -1) {
-            dvbdemux_stop(pmtFd);
-            close(pmtFd);
-        }
-    }
-    _psiData[frequency] = pmt;
-    // Remember the PAT version.
-    return true;
+    if (GetStreamInfo(frequency, programNumber, stream))
+        StartPlayBack(frequency, modulation, stream.pmtPid, stream.videoPid, stream.audioPid, tunerHandler);
 }
 
 TvmRc SourceBackend::GetTSInfo(TSInfoList& tsInfoList)
@@ -736,4 +540,90 @@ TvmRc SourceBackend::GetTSInfo(TSInfoList& tsInfoList)
     }
     return rc;
 }
+
+bool SourceBackend::PlayBackInitialization()
+{
+    _gstPlayBackData.pipeline = gst_pipeline_new("pipeline");
+    _gstPlayBackData.dvbSource = gst_element_factory_make("dvbsrc", "source");
+    _gstPlayBackData.decoder = gst_element_factory_make("decodebin", "decoder");
+    _gstPlayBackData.audioQueue = gst_element_factory_make("queue","audioqueue");
+    _gstPlayBackData.videoQueue = gst_element_factory_make("queue","videoqueue");
+    _gstPlayBackData.videoConvert = gst_element_factory_make("videoconvert", "videoconv");
+    _gstPlayBackData.audioConvert = gst_element_factory_make("audioconvert", "audioconv");
+    _gstPlayBackData.videoSink = gst_element_factory_make("autovideosink", "videosink");
+    _gstPlayBackData.audioSink = gst_element_factory_make("autoaudiosink", "audiosink");
+    _gstPlayBackData.loop = g_main_loop_new(nullptr, FALSE);
+
+    if (!_gstPlayBackData.pipeline || !_gstPlayBackData.dvbSource || !_gstPlayBackData.decoder || !_gstPlayBackData.audioQueue || !_gstPlayBackData.videoQueue || !_gstPlayBackData.videoConvert
+        || !_gstPlayBackData.audioConvert || !_gstPlayBackData.videoSink || !_gstPlayBackData.audioSink) {
+        TRACE(Trace::Error, (_T("One gstreamer element could not be created.")));
+        return false;
+    }
+    gst_bin_add_many(GST_BIN(_gstPlayBackData.pipeline), _gstPlayBackData.dvbSource, _gstPlayBackData.decoder, _gstPlayBackData.audioQueue, _gstPlayBackData.audioConvert, _gstPlayBackData.audioSink
+        , _gstPlayBackData.videoQueue, _gstPlayBackData.videoConvert, _gstPlayBackData.videoSink, nullptr);
+
+    if (!gst_element_link(_gstPlayBackData.dvbSource, _gstPlayBackData.decoder) || !gst_element_link_many(_gstPlayBackData.audioQueue, _gstPlayBackData.audioConvert, _gstPlayBackData.audioSink, nullptr)
+        || !gst_element_link_many(_gstPlayBackData.videoQueue, _gstPlayBackData.videoConvert, _gstPlayBackData.videoSink, nullptr)) {
+        TRACE(Trace::Error, (_T("Gstreamer link error.")));
+        return false;
+    }
+
+    if (_tunerCount == 1) {
+        _gstPlayBackData.bus = gst_pipeline_get_bus(GST_PIPELINE (_gstPlayBackData.pipeline));
+        gst_bus_add_signal_watch(_gstPlayBackData.bus);
+        if (g_signal_connect(_gstPlayBackData.bus, "message", (GCallback)OnBusMessage, &_gstFilteringData))
+            TRACE(Trace::Information, (_T("GStreamer connect success.")));
+    }
+
+    if (g_signal_connect(_gstPlayBackData.decoder, "pad-added", G_CALLBACK(OnPadAdded), &_gstPlayBackData) && g_signal_connect(_gstPlayBackData.decoder, "pad-added", G_CALLBACK(OnPadAdded), &_gstPlayBackData))
+        return true;
+    return false;
+}
+
+bool SourceBackend::FilteringInitialization()
+{
+    gst_mpegts_initialize ();
+    _gstFilteringData.pipeline = gst_pipeline_new("pipeline");
+    _gstFilteringData.dvbSource = gst_element_factory_make("dvbsrc", "source");
+    _gstFilteringData.demux = gst_element_factory_make("tsdemux", "demux");
+    _gstFilteringData.loop = g_main_loop_new(nullptr, FALSE);
+
+    if (!_gstFilteringData.pipeline || !_gstFilteringData.dvbSource || !_gstFilteringData.demux) {
+        TRACE(Trace::Error, (_T("One gstreamer element could not be created.")));
+        return false;
+    }
+    gst_bin_add_many(GST_BIN(_gstFilteringData.pipeline), _gstFilteringData.dvbSource, _gstFilteringData.demux, nullptr);
+
+    if (!gst_element_link(_gstFilteringData.dvbSource, _gstFilteringData.demux)) {
+        TRACE(Trace::Error, (_T("GStreamer link error.")));
+        return false;
+    }
+
+    _gstFilteringData.bus = gst_pipeline_get_bus(GST_PIPELINE(_gstFilteringData.pipeline));
+    gst_bus_add_signal_watch(_gstFilteringData.bus);
+    if (g_signal_connect(_gstFilteringData.bus, "message", (GCallback)OnBusMessage, &_gstFilteringData)) {
+        TRACE(Trace::Information, (_T("GStreamer connect success.")));
+        return true;
+    }
+    return false;
+}
+
+bool SourceBackend::StartFiltering(uint32_t frequency, string pids, GstMpegtsSectionType section)
+{
+    g_object_set(G_OBJECT(_gstFilteringData.dvbSource), "frequency", frequency,
+            "adapter", _adapter,
+            "delsys", _sType, // delivery system : atsc
+            "modulation", _tunerData->modulation, // modulation : 8vsb
+            "tuning-timeout", _tuningTimeout,
+            "pids", pids.c_str(), nullptr);
+
+    g_object_set (_gstFilteringData.demux, "emit-stats", TRUE, nullptr);
+
+    _gstFilteringData.section = section;
+    _gstFilteringData.frequency = frequency;
+    _gstFilteringData.sectionHandler = _sectionHandler;
+    gst_element_set_state(_gstFilteringData.pipeline, GST_STATE_PLAYING);
+    return true;
+}
+
 } // namespace LinuxDVB

@@ -243,9 +243,7 @@ void TVControlImplementation::ScanningStateChanged(const ScanningState state)
     if ((state == Completed) || ((state == Stopped))) {
         _tuner->StoreFrequencyListInDB();
         _tableData->NotifyFrequencyListUpdate();
-        if(_tuner->StoreTSInfoInDB()) {
-            _tableData->NotifyTSInfoUpdate();
-        }
+        _tuner->StoreTSInfoInDB();
     }
 
     _adminLock.Lock();

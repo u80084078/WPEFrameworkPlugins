@@ -28,11 +28,7 @@
 #ifndef TUNER_BACKEND_H_
 #define TUNER_BACKEND_H_
 
-#include "TVCommon.h"
 #include "SourceBackend.h"
-
-#include <math.h>
-#include <sstream>
 
 #define DVB_ADAPTER_SCAN 6
 #define CONFIGFILE "TVConfig.txt"
@@ -44,7 +40,6 @@ public:
     TvTunerBackend(uint32_t, std::unique_ptr<TunerData>, bool);
     virtual ~TvTunerBackend();
 
-    SourceType GetSrcType() { return _sType; };
     void GetSignalStrength(double*);
     TvmRc StartScanning(std::vector<uint32_t>, TVPlatform::ITVPlatform::ITunerHandler&);
     TvmRc StopScanning();
@@ -58,14 +53,12 @@ public:
     void UpdateTunerCount(uint32_t);
     bool IsScanning();
     std::vector<uint32_t>& GetFrequencyList();
-
     std::unique_ptr<struct TunerData> _tunerData;
 
 private:
     uint32_t BaseOffset(uint32_t, ChannelList);
     uint32_t FrequencyStep(uint32_t, ChannelList);
-    int32_t GetSupportedSourcesTypeList(SrcTypesVector*);
-    void GetAvailableSrcList(SrcTypesVector*);
+    int32_t GetSupportedSourcesTypeList();
     void InitializeSourceList();
     void GetSources();
     void SetModulation(std::string&);
@@ -76,10 +69,9 @@ private:
 private:
     std::unique_ptr<SourceBackend> _source;
     ChannelList _channel;
-    SourceType _sType;
-    SourceType* _srcTypeListPtr;
+    fe_delivery_system_t _sType;
+    std::vector<fe_delivery_system_t> _srcTypeList;
     int32_t _supportedSysCount;
-    SrcTypesVector _srcList; // List of src type.
     ConfigInfo _configValues;
     uint32_t _tunerIndex;
     uint32_t _tunerCount;

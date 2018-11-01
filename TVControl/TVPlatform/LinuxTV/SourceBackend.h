@@ -31,23 +31,24 @@
 #include "TVCommon.h"
 #include <interfaces/ITVPlatform.h>
 
-#include <chrono>
-#include <fstream>
-#include <libdvbapi/dvbdemux.h>
-#include <poll.h>
-#include <thread>
 #include <tracing/tracing.h>
 
-#include <gst/gst.h>
 #include <glib.h>
+#include <gst/gst.h>
+#include <gst/mpegts/mpegts.h>
+#include <set>
 
 #define BUFFER_SIZE 4096
 #define DATA_OFFSET 6
 #define SIZE_OFFSET 4
 
-struct GstElementData {
+namespace LinuxDVB {
+class TvControlBackend;
+class SourceBackend;
+
+struct GstPlayBackData {
     GstElement* pipeline;
-    GstElement* source;
+    GstElement* dvbSource;
     GstElement* decoder;
     GstElement* audioQueue;
     GstElement* videoQueue;
@@ -55,14 +56,25 @@ struct GstElementData {
     GstElement* videoConvert;
     GstElement* audioSink;
     GstElement* videoSink;
+    GMainLoop* loop;
+    GstBus* bus;
 };
 
-namespace LinuxDVB {
-class TvControlBackend;
+struct GstFilteringData {
+    GstElement* pipeline;
+    GstElement* dvbSource;
+    GstElement* demux;
+    GMainLoop* loop;
+    GstBus* bus;
+    uint32_t frequency;
+    GstMpegtsSectionType section;
+    TVPlatform::ITVPlatform::ISectionHandler* sectionHandler;
+};
+
 
 class SourceBackend {
 public:
-    SourceBackend(SourceType, TunerData*);
+    SourceBackend(fe_delivery_system_t, TunerData*);
     ~SourceBackend();
 
     TvmRc StartScanning(std::vector<uint32_t>, TVPlatform::ITVPlatform::ITunerHandler&);
@@ -74,36 +86,31 @@ public:
     TvmRc StopFilters();
     TvmRc GetChannelMap(ChannelMap&);
     TvmRc GetTSInfo(TSInfoList&);
-    SourceType SrcType() { return _sType; }
     bool IsScanning() { return _isScanInProgress; }
     std::vector<uint32_t>& GetFrequencyList();
     void UpdateTunerCount(uint32_t tunerCount) { _tunerCount = tunerCount; }
+    static void OnPadAdded(GstElement*, GstPad*, GstPlayBackData*);
+    static void OnBusMessage (GstBus*, GstMessage*, GstFilteringData*);
+    static AtscPSI _psiData;
 
 private:
-    bool StartPlayBack(uint32_t, uint32_t, uint16_t, uint16_t, uint16_t);
+    bool StartPlayBack(uint32_t, uint32_t, uint16_t, uint16_t, uint16_t, TVPlatform::ITVPlatform::ITunerHandler&);
     bool StopPlayBack();
-    bool TuneToFrequency(uint32_t, uint32_t, struct dvbfe_handle*);
-    void AtscScan(uint32_t, uint32_t);
-    void MpegScan(uint32_t);
-    void DvbScan();
-    bool ProcessPAT(uint32_t, int32_t);
-    bool ProcessPMT(int32_t, AtscStream&);
-    int32_t CreateSectionFilter(uint16_t, uint8_t, bool);
     void SectionFilterThread();
     void ScanningThread(std::vector<uint32_t>, TVPlatform::ITVPlatform::ITunerHandler&);
     TvmRc SetCurrentChannel(uint32_t, uint16_t, uint16_t, TVPlatform::ITVPlatform::ITunerHandler&);
     void SetCurrentChannelThread(uint32_t, uint16_t, uint16_t, TVPlatform::ITVPlatform::ITunerHandler&);
-    bool PopulateChannelData(uint32_t);
     void ResumeFiltering();
     bool PauseFiltering();
     bool GetStreamInfo(uint32_t, uint16_t, AtscStream&);
+    bool FilteringInitialization();
+    bool PlayBackInitialization();
+    bool StartFiltering(uint32_t, string, GstMpegtsSectionType);
 
 private:
-    SourceType _sType;
+    fe_delivery_system_t _sType;
     TunerData* _tunerData;
-    std::thread _sectionFilterThread;
     int32_t _adapter;
-    int32_t _demux;
 
     volatile bool _isScanStopped;
     volatile bool _isRunning;
@@ -118,21 +125,25 @@ private:
     std::mutex _scanCompleteMutex;
     std::condition_variable_any _scanCompleteCondition;
 
-    AtscPSI _psiData;
+    std::mutex _sectionFilterMutex;
+    std::condition_variable_any _sectionFilterCondition;
 
     std::vector<struct pollfd> _pollFds;
     std::map<uint16_t, uint32_t> _pollFdsMap;
-    std::mutex _sectionFilterMutex;
-    std::condition_variable_any _sectionFilterCondition;
     TVPlatform::ITVPlatform::ISectionHandler* _sectionHandler;
-    struct dvbfe_handle* _feHandle;
+    DVBInfo _feInfo;
     std::vector<uint32_t> _frequencyList;
     uint32_t _currentTunedFrequency;
     uint32_t _tunerCount;
     bool _playbackInProgress;
 
-    GstElementData _gstData;
-    bool _isGstreamerInitialized;
+    GstPlayBackData _gstPlayBackData;
+    GstFilteringData _gstFilteringData;
+    bool _isGstreamerPlayBackInitialized;
+    bool _isGstreamerFilteringInitialized;
+    uint64_t _tuningTimeout;
+    std::set<uint16_t> _pidSet;
+    bool _isTunerUsed;
 };
 
 } // namespace LinuxDVB

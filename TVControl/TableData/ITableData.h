@@ -101,7 +101,6 @@ class ITableData
         void StopFilters();
         void SetHomeTS(const uint32_t, const uint32_t);
         void EitBroadcasted();
-        bool IsTSInfoPresent();
         bool IsScanning();
         void UpdateScanStatus();
         void StartTimer();
@@ -121,7 +120,6 @@ class ITableData
         bool SetParentalLock(const string&, const bool, const string&);
         bool ParentalControlInit();
         void NotifyFrequencyListUpdate();
-        void NotifyTSInfoUpdate();
         void NotifyStreamingFrequencyChange(uint32_t);
         bool UpdateParentalLockFile();
 
@@ -140,7 +138,6 @@ class ITableData
         bool _isParentalLocked;
         ITableDataHandler& _tableDataHandler;
         uint16_t _homeTS;
-        volatile bool _isTSInfoPresent;
     };
 }
 }
