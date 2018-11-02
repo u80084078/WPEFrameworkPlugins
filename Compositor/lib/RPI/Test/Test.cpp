@@ -1,6 +1,7 @@
 #include <string>
 #include <chrono>
 #include <iostream>
+#include <fcntl.h>
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -120,6 +121,9 @@ public:
 
         setupEGL();
         idisplay = Compositor::IDisplay::Instance(DisplayName());
+
+        int fd = idisplay->FileDescriptor();
+        fcntl(fd, F_SETFL, O_NONBLOCK);
 
         for (int i = 0; i < MAX_SURFACES; i++) {
 

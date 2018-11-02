@@ -206,12 +206,9 @@ public:
     }
 
     uint32_t ToTop(const string& callsign) override {
-        if (_currentClientOnTop != nullptr) {
-            _currentClientOnTop->ChangedZOrder(-1);
-        }
-        // todo correct implementation
         return CallOnClientByCallsign(callsign, [&](Exchange::IComposition::IClient& client) {
-            _currentClientOnTop = &client; client.ChangedZOrder(1); } );
+            RecalculateZOrder(&client);
+        });
     }
 
     uint32_t PutBelow(const string& callsignRelativeTo, const string& callsignToReorder) override {
@@ -276,11 +273,7 @@ private:
                 for( auto&& index : _observers) {
                     index->Attached(client);
                 }
-
-                client->AddRef(); // for call to RecalculateZOrder
-
                 _adminLock.Unlock();
-
                 RecalculateZOrder(client); //note: do outside lock
             }
         }
@@ -310,19 +303,49 @@ private:
             ++it;
         }
         _adminLock.Unlock();
-
+        RecalculateZOrder(nullptr); //note: do outside lock
         TRACE(Trace::Information, (_T("Client detached completed")));
     }
 
     // on new client
     void RecalculateZOrder(Exchange::IComposition::IClient* client) {
-        ASSERT(client != nullptr);
-        if (_currentClientOnTop != nullptr) {
-            _currentClientOnTop->ChangedZOrder(-1);
+
+        _adminLock.Lock();
+
+        // Search given client & _currentClientOnTop
+        bool clientFound = false, topFound = false;
+        auto it = _clients.begin();
+        while(it != _clients.end()) {
+            if (it->second.clientInterface == client) {
+                clientFound = true;
+            }
+            if (it->second.clientInterface == _currentClientOnTop ) {
+                topFound = true;
+            }
+            ++it;
         }
-        _currentClientOnTop = client;
-        client->ChangedZOrder(1);
-        client->Release();
+        // if client is found, set it to top
+        if (clientFound) {
+            // Push the current top to behind
+            if ((topFound) && (_currentClientOnTop != client))
+                _currentClientOnTop->ChangedZOrder(-1);
+            // Set the client as current top
+            _currentClientOnTop = client;
+            client->ChangedZOrder(1);
+        }
+        else {
+            // if top not found, set the first one to top
+            if (!topFound) {
+                _currentClientOnTop = nullptr;
+                it = _clients.begin();
+                if (it != _clients.end()) {
+                    client = it->second.clientInterface;
+                    _currentClientOnTop = client;
+                    client->ChangedZOrder(1);
+                }
+            }
+        }
+        _adminLock.Unlock();
     }
 
     void PlatformReady() {
