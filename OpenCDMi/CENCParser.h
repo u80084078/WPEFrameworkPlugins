@@ -53,31 +53,22 @@ public:
         inline KeyId(const systemType type, const uint32_t a, const uint16_t b, const uint16_t c, const uint8_t d[])
             : _systems(type)
             , _status(::OCDM::ISession::StatusPending) {
-            // A bit confused on how the mapping of the Microsoft KeyId's should go, looking at the spec: 
+            // A bit confused on how the mapping of the Microsoft KeyId's should go, looking at the spec:
             // https://msdn.microsoft.com/nl-nl/library/windows/desktop/aa379358(v=vs.85).aspx
-            // Assuming the LSB first it would be
-            // _kid[0] = a & 0xFF;
-            // _kid[1] = (a >> 8) & 0xFF;
-            // _kid[2] = (a >> 16) & 0xFF;
-            // _kid[3] = (a >> 24) & 0xFF;
-            // _kid[4] = b & 0xFF;
-            // _kid[5] = (b >> 8) & 0xFF;
-            // _kid[6] = c & 0xFF;
-            // _kid[7] = (c >> 8) & 0xFF;
+            // Some test cases have a little endian byte ordering for the GUID, other a MSB ordering.
+            _kid[0] = a & 0xFF;
+            _kid[1] = (a >> 8) & 0xFF;
+            _kid[2] = (a >> 16) & 0xFF;
+            _kid[3] = (a >> 24) & 0xFF;
+            _kid[4] = b & 0xFF;
+            _kid[5] = (b >> 8) & 0xFF;
+            _kid[6] = c & 0xFF;
+            _kid[7] = (c >> 8) & 0xFF;
 
-            // Assuming the MSB first it would be
-            _kid[3] = a & 0xFF;
-            _kid[2] = (a >> 8) & 0xFF;
-            _kid[1] = (a >> 16) & 0xFF;
-            _kid[0] = (a >> 24) & 0xFF;
-            _kid[5] = b & 0xFF;
-            _kid[4] = (b >> 8) & 0xFF;
-            _kid[7] = c & 0xFF;
-            _kid[6] = (c >> 8) & 0xFF;
             ::memcpy(&(_kid[8]), d, 8);
         }
-        inline KeyId(const KeyId& copy) 
-            : _systems(copy._systems) 
+        inline KeyId(const KeyId& copy)
+            : _systems(copy._systems)
             , _status(copy._status) {
             ::memcpy(_kid, copy._kid, sizeof(_kid));
         }
@@ -96,13 +87,40 @@ public:
             return (operator!=(InvalidKey));
         }
         inline bool operator==(const uint8_t rhs[]) const {
-            return (::memcmp(rhs, _kid, sizeof(_kid)) == 0);
+            // Hack, in case of PlayReady, the key offered on the interface might be
+            // ordered incorrectly, cater for this situation, by silenty comparing with this incorrect value.
+            bool equal = false;
+
+            // Regardless of the order, the last 8 bytes should be equal
+            if (memcmp (&_kid[8], &(rhs[8]), 8)  == 0) {
+
+                // Lets first try the non swapped byte order.
+                if (memcmp (_kid, rhs, 8)  == 0) {
+                    // this is a match :-)
+                    equal = true;
+                }
+                else {
+                    // Let do the byte order alignment as suggested in the spec and see if it matches than :-)
+                    // https://msdn.microsoft.com/nl-nl/library/windows/desktop/aa379358(v=vs.85).aspx
+                    uint8_t alignedBuffer[8];
+                    alignedBuffer[0] = rhs[3];
+                    alignedBuffer[1] = rhs[2];
+                    alignedBuffer[2] = rhs[1];
+                    alignedBuffer[3] = rhs[0];
+                    alignedBuffer[4] = rhs[5];
+                    alignedBuffer[5] = rhs[4];
+                    alignedBuffer[6] = rhs[7];
+                    alignedBuffer[7] = rhs[6];
+                    equal = (memcmp (_kid, alignedBuffer, 8)  == 0);
+                }
+            }
+            return (equal);
         }
         inline bool operator!=(const uint8_t rhs[]) const {
             return !(operator==(rhs));
         }
         inline bool operator==(const KeyId& rhs) const {
-            return (::memcmp(_kid, rhs._kid, sizeof(_kid)) == 0);
+            return (operator==(rhs._kid));
         }
         inline bool operator!=(const KeyId& rhs) const {
             return !(operator==(rhs));
@@ -175,11 +193,11 @@ public:
        std::list<KeyId>::iterator index (std::find(_keyIds.begin(), _keyIds.end(), key));
 
        if (index == _keyIds.end()) {
-            printf ("Added key: %s for system: %02X\n", key.ToString().c_str(), key.Systems());
+            TRACE_L1("Added key: %s for system: %02X\n", key.ToString().c_str(), key.Systems());
             _keyIds.emplace_back(key);
         }
         else {
-            printf ("Updated key: %s for system: %02X\n", key.ToString().c_str(), key.Systems());
+            TRACE_L1("Updated key: %s for system: %02X\n", key.ToString().c_str(), key.Systems());
             index->Flag(key.Systems());
         }
     }
@@ -355,7 +373,7 @@ private:
             count /= KeyId::Length();
         }
 
-        TRACE_L1("Addin %d keys\n", count);
+        TRACE_L1("Adding %d keys from PSSH box\n", count);
 
         while (count-- != 0) {
             AddKeyId(KeyId(system, psshData, KeyId::Length()));
@@ -393,18 +411,16 @@ private:
             uint16_t begin;
             uint16_t size = (length - 10);
             const uint8_t* slot = &data[10];
-            
+
             // Now find the string <KID> in this text
             while ((size > 0) && ((begin = FindInXML (slot, size, "<KID>", 5)) < size)) {
                 uint16_t end = FindInXML (&(slot[begin + 10]), size - begin - 10, "</KID>", 6);
 
-                
                 if (end < (size - begin - 10)) {
                     uint8_t byteArray[32];
 
                     // We got a KID, translate it
-                    if (Base64(&(slot[begin + 10]), end , byteArray, sizeof(byteArray)) == KeyId::Length()) {
-
+                    if (Base64(&(slot[begin + 10]), static_cast<uint8_t>(end), byteArray, sizeof(byteArray)) == KeyId::Length()) {
                         // Pass it the microsoft way :-(
 			uint32_t a = byteArray[0];
 			         a = (a << 8)  | byteArray[1];
@@ -416,6 +432,7 @@ private:
                                  c = (c << 8) | byteArray[7];
                         uint8_t* d = &byteArray[8];
 
+                        // Add them in both endiannesses, since we have encountered both in the wild.
                         AddKeyId(KeyId(PLAYREADY, a, b, c, d));
                     }
                     size -= (begin + 10 +  end + 12);

@@ -1,5 +1,4 @@
-#ifndef __TRACECONTROL_H
-#define __TRACECONTROL_H
+#pragma once
 
 #include "Module.h"
 
@@ -161,7 +160,7 @@ namespace WPEFramework {
 						// Lazy creation, get the interface, if we want to iterate over the trace categories.
 						if ((_iterator == nullptr) && (_process != nullptr))
 						{
-							_iterator = static_cast<Trace::ITraceIterator*>(_process->Instantiate(Core::infinite, _T("TraceIterator"), Trace::ITraceIterator::ID, static_cast<uint32_t>(~0)));
+							_iterator = _process->Aquire<Trace::ITraceIterator>(Core::infinite, _T("TraceIterator"), static_cast<uint32_t>(~0));
 						}
 
 						if (_iterator != nullptr)
@@ -176,7 +175,7 @@ namespace WPEFramework {
 						// Lazy creation, get the interface, if we want to iterate over the trace categories.
 						if ((_iterator == nullptr) && (_process != nullptr))
 						{
-							_iterator = static_cast<Trace::ITraceIterator*>(_process->Instantiate(Core::infinite, _T("TraceIterator"), Trace::ITraceIterator::ID, static_cast<uint32_t>(~0)));
+							_iterator = _process->Aquire<Trace::ITraceIterator>(Core::infinite, _T("TraceIterator"), static_cast<uint32_t>(~0));
 						}
 
 						if (_iterator != nullptr)
@@ -190,7 +189,7 @@ namespace WPEFramework {
 					{
 						if (_control == nullptr)
 						{
-							_control = static_cast<Trace::ITraceController*>(_process->Instantiate(Core::infinite, _T("TraceController"), Trace::ITraceController::ID, static_cast<uint32_t>(~0)));
+							_control = _process->Aquire<Trace::ITraceController>(Core::infinite, _T("TraceController"), static_cast<uint32_t>(~0));
 						}
 
 						if (_control != nullptr)
@@ -994,5 +993,3 @@ namespace WPEFramework {
 		};
 	}
 }
-
-#endif // __TRACECONTROL_H

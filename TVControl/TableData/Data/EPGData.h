@@ -45,11 +45,10 @@ public:
     bool InsertProgramInfo(uint16_t, uint16_t, time_t, time_t, const char*,
         const std::string&, const std::string&, const std::string&, const std::string&);
     bool InsertNitInfo(uint16_t, uint16_t, uint16_t, uint32_t, uint8_t);
-    bool GetServiceIdFromChannelInfo(const string&, uint16_t&);
-    bool GetFrequencyFromChannelInfo(const string&, uint32_t&);
+    bool GetTuneInfo(const string& lcn, uint32_t& frequency, uint16_t& programNummber, uint16_t& modulation);
     bool ReadFrequency(std::vector<uint32_t>&);
     bool ReadChannel(const string&, WPEFramework::Channel&);
-    bool GetFrequencyListFromNit(std::vector<uint32_t>&);
+    bool GetFrequencyListFromNit(std::vector<uint32_t>&, uint16_t originalNetworkId = 0);
     bool GetFrequencyAndModulationFromNit(uint16_t, uint16_t, uint32_t&, uint8_t&);
     void ClearSIData();
     int LoadOrSaveDB(bool);
@@ -61,9 +60,9 @@ public:
     bool IsParentalLocked(const string&);
     bool SetParentalLock(const bool, const string&);
     bool InsertTSInfo(TSInfoList&);
-    bool ReadTSInfo(TSInfo&);
     bool IsServicePresentInTSInfo(int32_t);
     bool UnlockChannels();
     bool IsServicePresentInChannelTable(uint16_t, uint16_t, uint16_t&);
+    bool TableExists(string);
 };
 #endif

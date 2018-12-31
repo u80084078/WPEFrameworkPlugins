@@ -57,7 +57,7 @@ bool EPGDataBase::OpenDB()
     if (!sqlite3_open(":memory:", &_dataBase)) {
         TRACE(Trace::Information, (_T("Open Success")));
         return true;
-    } 
+    }
     TRACE(Trace::Error, (_T("Open Failed")));
     return false;
 }
@@ -99,6 +99,25 @@ bool EPGDataBase::CreateNitTable()
     return ExecuteSQLQuery(sqlQuery);
 }
 
+bool EPGDataBase::TableExists(string table)
+{
+    char sqlDelete[1024];
+    DBLock();
+    snprintf(sqlDelete, 1024, "SELECT Count(*) FROM sqlite_master WHERE type='table' AND name='{%s}';", table.c_str());
+    sqlite3_prepare_v2(_dataBase, sqlDelete, -1, &_stmt, nullptr);
+    TRACE_L3("QUERY = %s", sqlDelete);
+    if ((sqlite3_step(_stmt) == SQLITE_ROW) && !sqlite3_column_int(_stmt, 0)) {
+        TRACE_L4("%s table doesn't exist", table.c_str());
+        sqlite3_finalize(_stmt);
+        DBUnlock();
+        return false;
+    }
+    TRACE_L4("%s table exists", table.c_str());
+    sqlite3_finalize(_stmt);
+    DBUnlock();
+    return true;
+}
+
 bool EPGDataBase::ExecuteSQLQuery(char const* sqlQuery)
 {
     bool status = true;
@@ -108,7 +127,7 @@ bool EPGDataBase::ExecuteSQLQuery(char const* sqlQuery)
         sqlite3_free(_errMsg);
         status = false;
     } else
-        TRACE(Trace::Information, (_T("Sql query executed successfully")));
+        TRACE_L4("Sql query executed successfully", NULL);
 
     DBUnlock();
     return status;
@@ -178,11 +197,11 @@ bool EPGDataBase::DBLock()
     f1.l_pid = getpid(); // our PID.
     ret = fcntl(_fd, F_SETLKW, &f1);  // Set the lock, waiting if necessary.
     if (!ret) {
-        TRACE(Trace::Information, (_T("DB LOCKED")));
+        TRACE_L4("DB LOCKED", NULL);
         return true;
     }
 
-    TRACE(Trace::Information, (_T("DB ALREADY LOCKED")));
+    TRACE_L4("DB ALREADY LOCKED", NULL);
     return false;
 }
 
@@ -197,10 +216,10 @@ bool EPGDataBase::DBUnlock()
     f1.l_pid = getpid(); // our PID.
     ret = fcntl(_fd, F_SETLK, &f1); // set the region to unlocked.
     if (!ret) {
-        TRACE(Trace::Information, (_T("DB UNLOCKED")));
+        TRACE_L4("DB UNLOCKED", NULL);
         return true;
     }
-    TRACE(Trace::Information, (_T("DB ALREADY UNLOCKED")));
+    TRACE_L4("DB ALREADY UNLOCKED", NULL);
     return false;
 }
 
@@ -209,7 +228,7 @@ bool EPGDataBase::InsertFrequencyInfo(std::vector<uint32_t> frequencyList)
     char sqlQuery[1024];
     for (auto& frequency : frequencyList) {
         snprintf(sqlQuery, 1024, "INSERT OR IGNORE INTO FREQUENCY (FREQUENCY) VALUES (%d);", (int)frequency);
-        TRACE(Trace::Information, (_T("QUERY = %s"), sqlQuery));
+        TRACE_L4("QUERY = %s", sqlQuery);
         if (!ExecuteSQLQuery(sqlQuery)) {
             return false;
         }
@@ -223,10 +242,43 @@ bool EPGDataBase::InsertNitInfo(uint16_t networkId, uint16_t tsId, uint16_t orig
 
     snprintf(sqlQuery, 1024, "INSERT OR IGNORE INTO NIT (NETWORK_ID, TRANSPORT_STREAM_ID, ORIGINAL_NETWORK_ID, FREQUENCY, MODULATION) VALUES (%d, %d, %d, %d, %d);", (int)networkId, (int)tsId, (int)originalNetworkId, (int)frequency, (int)modulation);
 
-    TRACE(Trace::Information, (_T("QUERY = %s"), sqlQuery));
+    TRACE_L4("QUERY = %s", sqlQuery);
     return ExecuteSQLQuery(sqlQuery);
 }
 
+bool EPGDataBase::GetTuneInfo(const string& lcn, uint32_t& frequency, uint16_t& programNummber, uint16_t& modulation)
+{
+    char sqlQuery[1024];
+    uint32_t rc = 0;
+    bool ret = false;
+    std::string table("CHANNEL");
+    if (!IsTableEmpty(table)) {
+        DBLock();
+        uint32_t freq;
+        uint16_t prog, mod;
+        snprintf(sqlQuery, 1024, "SELECT FREQUENCY, PROGRAM_NUMBER, MODULATION FROM CHANNEL WHERE LCN=%s;", lcn.c_str());
+        TRACE_L3("QUERY = %s", sqlQuery);
+         if (sqlite3_prepare(_dataBase, sqlQuery, -1, &_stmt, 0) == SQLITE_OK) {
+            rc = sqlite3_step(_stmt);
+            if ((rc == SQLITE_ROW) || (rc == SQLITE_DONE)) {
+                freq = (uint32_t)sqlite3_column_int(_stmt, 0);
+                prog = (uint16_t)sqlite3_column_int(_stmt, 1);
+                mod  = (uint16_t)sqlite3_column_int(_stmt, 2);
+            }
+            sqlite3_reset(_stmt);
+            if (sqlite3_finalize(_stmt) == SQLITE_OK) {
+                frequency = freq;
+                programNummber = prog;
+                modulation = mod;
+                ret = true;
+            }
+        }
+        DBUnlock();
+    }
+    return ret;
+}
+
+#if 0
 bool EPGDataBase::GetFrequencyFromChannelInfo(const string& lcn, uint32_t& frequency)
 {
     char sqlQuery[1024];
@@ -237,42 +289,14 @@ bool EPGDataBase::GetFrequencyFromChannelInfo(const string& lcn, uint32_t& frequ
         DBLock();
         uint32_t freq;
         snprintf(sqlQuery, 1024, "SELECT FREQUENCY FROM CHANNEL WHERE LCN=%s;", lcn.c_str());
-        if (sqlite3_prepare(_dataBase, sqlQuery, -1, &_stmt, 0) == SQLITE_OK) {
+        TRACE_L3("QUERY = %s", sqlQuery);
+         if (sqlite3_prepare(_dataBase, sqlQuery, -1, &_stmt, 0) == SQLITE_OK) {
             rc = sqlite3_step(_stmt);
             if ((rc == SQLITE_ROW) || (rc == SQLITE_DONE))
                 freq = (uint32_t)sqlite3_column_int(_stmt, 0);
             sqlite3_reset(_stmt);
             if (sqlite3_finalize(_stmt) == SQLITE_OK) {
                 frequency = freq;
-                ret = true;
-            }
-        }
-        DBUnlock();
-    }
-    return ret;
-}
-
-bool EPGDataBase::GetFrequencyAndModulationFromNit(uint16_t originalNetworkId, uint16_t transportStreamId, uint32_t& frequency, uint8_t& modulation)
-{
-    char sqlQuery[1024];
-    uint32_t rc = 0;
-    bool ret = false;
-    std::string table("NIT");
-    if (!IsTableEmpty(table)) {
-        DBLock();
-        uint32_t freq;
-        uint32_t mod;
-        snprintf(sqlQuery, 1024, "SELECT * FROM NIT WHERE ORIGINAL_NETWORK_ID=%d AND TRANSPORT_STREAM_ID=%d;", (int)originalNetworkId, (int)transportStreamId);
-        if (sqlite3_prepare(_dataBase, sqlQuery, -1, &_stmt, 0) == SQLITE_OK) {
-            rc = sqlite3_step(_stmt);
-            if ((rc == SQLITE_ROW) || (rc == SQLITE_DONE)) {
-                freq = (uint32_t)sqlite3_column_int(_stmt, 3);
-                mod = (uint8_t)sqlite3_column_int(_stmt, 4);
-            }
-            sqlite3_reset(_stmt);
-            if (sqlite3_finalize(_stmt) == SQLITE_OK) {
-                frequency = freq;
-                modulation = mod;
                 ret = true;
             }
         }
@@ -291,6 +315,7 @@ bool EPGDataBase::GetServiceIdFromChannelInfo(const string& lcn, uint16_t& servi
         DBLock();
         uint16_t svcId;
         snprintf(sqlQuery, 1024, "SELECT PROGRAM_NUMBER FROM CHANNEL WHERE LCN=%s;", lcn.c_str());
+        TRACE_L3("QUERY = %s", sqlQuery);
         if (sqlite3_prepare(_dataBase, sqlQuery, -1, &_stmt, 0) == SQLITE_OK) {
             rc = sqlite3_step(_stmt);
             if ((rc == SQLITE_ROW) || (rc == SQLITE_DONE))
@@ -298,6 +323,37 @@ bool EPGDataBase::GetServiceIdFromChannelInfo(const string& lcn, uint16_t& servi
             sqlite3_reset(_stmt);
             if (sqlite3_finalize(_stmt) == SQLITE_OK) {
                 serviceId = svcId;
+                ret = true;
+            }
+        }
+        DBUnlock();
+    }
+    return ret;
+}
+#endif
+
+bool EPGDataBase::GetFrequencyAndModulationFromNit(uint16_t originalNetworkId, uint16_t transportStreamId, uint32_t& frequency, uint8_t& modulation)
+{
+    char sqlQuery[1024];
+    uint32_t rc = 0;
+    bool ret = false;
+    std::string table("NIT");
+    if (!IsTableEmpty(table)) {
+        DBLock();
+        uint32_t freq;
+        uint32_t mod;
+        snprintf(sqlQuery, 1024, "SELECT * FROM NIT WHERE ORIGINAL_NETWORK_ID=%d AND TRANSPORT_STREAM_ID=%d;", (int)originalNetworkId, (int)transportStreamId);
+        TRACE_L3("QUERY = %s", sqlQuery);
+         if (sqlite3_prepare(_dataBase, sqlQuery, -1, &_stmt, 0) == SQLITE_OK) {
+            rc = sqlite3_step(_stmt);
+            if ((rc == SQLITE_ROW) || (rc == SQLITE_DONE)) {
+                freq = (uint32_t)sqlite3_column_int(_stmt, 3);
+                mod = (uint8_t)sqlite3_column_int(_stmt, 4);
+            }
+            sqlite3_reset(_stmt);
+            if (sqlite3_finalize(_stmt) == SQLITE_OK) {
+                frequency = freq;
+                modulation = mod;
                 ret = true;
             }
         }
@@ -314,7 +370,7 @@ bool EPGDataBase::InsertChannelInfo(uint32_t frequency, uint32_t modulation, con
         NAME, LANGUAGE) VALUES (\"%s\", %d, %d, %d, %d, %d, %d, \"%s\", \"%s\");", lcn.c_str(), (int)frequency, (int)modulation
         , (int)serviceId, (int)tsId, (int)networkId, (int)programNo, name, language.size() ? language.c_str() : "und");
 
-    TRACE(Trace::Information, (_T("QUERY = %s"), sqlQuery));
+    TRACE_L3("QUERY = %s", sqlQuery);
     return ExecuteSQLQuery(sqlQuery);
 }
 
@@ -335,23 +391,33 @@ bool EPGDataBase::IsTableEmpty(const std::string& table)
     DBLock();
     snprintf(sqlDelete, 1024, "SELECT Count(*) FROM %s;", table.c_str());
     sqlite3_prepare_v2(_dataBase, sqlDelete, -1, &_stmt, nullptr);
+    TRACE_L3("QUERY = %s", sqlDelete);
     if ((sqlite3_step(_stmt) == SQLITE_ROW) && !sqlite3_column_int(_stmt, 0)) {
-        TRACE(Trace::Information, (_T("%s table empty"), table.c_str()));
+        TRACE_L4("%s table empty", table.c_str());
         sqlite3_finalize(_stmt);
         DBUnlock();
         return true;
     }
-    TRACE(Trace::Information, (_T("%s table has content"), table.c_str()));
+    TRACE_L4("%s table has content", table.c_str());
     sqlite3_finalize(_stmt);
     DBUnlock();
     return false;
 
 }
 
-bool EPGDataBase::GetFrequencyListFromNit(std::vector<uint32_t>& frequencyList)
+bool EPGDataBase::GetFrequencyListFromNit(std::vector<uint32_t>& frequencyList, uint16_t originalNetworkId)
 {
+    std::stringstream sqlQuery;
+
+    sqlQuery << "SELECT FREQUENCY FROM NIT";
+    if (originalNetworkId) {
+        sqlQuery << " WHERE ORIGINAL_NETWORK_ID == " << originalNetworkId;
+    }
+    sqlQuery << " ORDER BY TRANSPORT_STREAM_ID";
+
     DBLock();
-    sqlite3_prepare_v2(_dataBase, "SELECT FREQUENCY FROM NIT", -1, &_stmt, nullptr);
+    sqlite3_prepare_v2(_dataBase, sqlQuery.str().c_str(), -1, &_stmt, nullptr);
+    TRACE_L3("QUERY = %s", sqlQuery.str().c_str());
     while (sqlite3_step(_stmt) == SQLITE_ROW)
         frequencyList.push_back((uint32_t)sqlite3_column_int(_stmt, 0));
     sqlite3_finalize(_stmt);
@@ -376,7 +442,10 @@ bool EPGDataBase::ReadFrequency(std::vector<uint32_t>& frequencyList)
     bool ret = false;
     DBLock();
     uint32_t frequency;
-    sqlite3_prepare_v2(_dataBase, "SELECT * FROM FREQUENCY;", -1, &_stmt, nullptr);
+    const char *sqlQuery = "SELECT * FROM FREQUENCY";
+
+    TRACE_L3("QUERY = %s", sqlQuery);
+    sqlite3_prepare_v2(_dataBase, sqlQuery, -1, &_stmt, nullptr);
     frequencyList.clear();
     while (sqlite3_step(_stmt) == SQLITE_ROW) {
         frequency = (uint32_t)sqlite3_column_int(_stmt, 0);
@@ -395,8 +464,11 @@ bool EPGDataBase::ReadChannels(WPEFramework::Core::JSON::ArrayType<WPEFramework:
     bool ret = false;
     DBLock();
     std::string table("CHANNEL");
+
     if (!IsTableEmpty(table)) {
-        sqlite3_prepare_v2(_dataBase, "SELECT * FROM CHANNEL;", -1, &_stmt, nullptr);
+        const char *sqlQuery = "SELECT * FROM CHANNEL";
+        TRACE_L3("QUERY = %s", sqlQuery);
+        sqlite3_prepare_v2(_dataBase, sqlQuery, -1, &_stmt, nullptr);
         while (sqlite3_step(_stmt) == SQLITE_ROW) {
             WPEFramework::Channel channel;
             channel.number = reinterpret_cast<const char*>(sqlite3_column_text(_stmt, 0));
@@ -422,7 +494,8 @@ bool EPGDataBase::ReadChannel(const string& channelNum, WPEFramework::Channel& c
     std::string table("CHANNEL");
     if (!IsTableEmpty(table)) {
         DBLock();
-        snprintf(sqlQuery, 1024, "SELECT * FROM CHANNEL WHERE LCN=%s;", channelNum.c_str());
+        snprintf(sqlQuery, 1024, "SELECT * FROM CHANNEL WHERE LCN=%s", channelNum.c_str());
+        TRACE_L3("QUERY = %s", sqlQuery);
         sqlite3_prepare_v2(_dataBase, sqlQuery, -1, &_stmt, nullptr);
         while (sqlite3_step(_stmt) == SQLITE_ROW) {
             channel.number = reinterpret_cast<const char*>(sqlite3_column_text(_stmt, 0));
@@ -447,8 +520,11 @@ bool EPGDataBase::ReadPrograms(WPEFramework::Core::JSON::ArrayType<WPEFramework:
     time_t currTime;
     time(&currTime);
     TRACE(Trace::Information, (_T("current time = %d"), currTime));
+    const char *sqlQuery = "SELECT * FROM PROGRAM";
+    TRACE_L3("QUERY = %s", sqlQuery);
+
     DBLock();
-    sqlite3_prepare_v2(_dataBase, "SELECT * FROM PROGRAM;", -1, &_stmt, nullptr);
+    sqlite3_prepare_v2(_dataBase, sqlQuery, -1, &_stmt, nullptr);
     while (sqlite3_step(_stmt) == SQLITE_ROW) {
         time_t startTime = (time_t)sqlite3_column_int(_stmt, 2);
         if ((startTime < (currTime + EPG_DURATION)) && ((startTime + sqlite3_column_int(_stmt, 3)) > currTime)) {
@@ -479,8 +555,11 @@ bool EPGDataBase::ReadProgram(uint16_t serviceId, WPEFramework::Program& program
         time_t currTime;
         time(&currTime);
         TRACE(Trace::Information, (_T("current time = %d"), currTime));
+        const char *sqlQuery = "SELECT * FROM PROGRAM WHERE SOURCE_ID = ? ;";
+        TRACE_L3("QUERY = %s", sqlQuery);
+
         DBLock();
-        sqlite3_prepare_v2(_dataBase, "SELECT * FROM PROGRAM WHERE SOURCE_ID = ? ;", -1, &_stmt, nullptr);
+        sqlite3_prepare_v2(_dataBase, sqlQuery, -1, &_stmt, nullptr);
         sqlite3_bind_int(_stmt, 1, (int)serviceId);
         while (sqlite3_step(_stmt) == SQLITE_ROW) {
             time_t startTime = (time_t)sqlite3_column_int(_stmt, 2);
@@ -526,6 +605,7 @@ bool EPGDataBase::IsParentalLocked(const string& lcn)
             TRACE(Trace::Information, (_T("DataBase not yet created \n")));
             ret = false;
         }
+        free(buf);
     }
     return ret;
 }
@@ -599,42 +679,12 @@ bool EPGDataBase::InsertTSInfo(TSInfoList& TSInfoList)
     char sqlQuery[1024];
     for (auto& tsInfo : TSInfoList) {
         snprintf(sqlQuery, 1024, "INSERT OR IGNORE INTO TSINFO (FREQUENCY, PROGRAM_NUMBER, VIDEO_PID, VIDEO_CODEC, VIDEO_PCR_PID, AUDIO_PID, AUDIO_CODEC, AUDIO_PCR_PID, PMT_PID) VALUES (%d, %d, %d, %d, %d, %d, %d, %d, %d);", (int)tsInfo.frequency, tsInfo.programNumber, tsInfo.videoPid, tsInfo.videoCodec, tsInfo.videoPcrPid, tsInfo.audioPid, tsInfo.audioCodec, tsInfo.audioPcrPid, tsInfo.pmtPid);
-        TRACE(Trace::Information, (_T("QUERY = %s"), sqlQuery));
+        TRACE_L3("QUERY = %s", sqlQuery);
         if (!ExecuteSQLQuery(sqlQuery)) {
             return false;
         }
     }
     return true;
-}
-
-bool EPGDataBase::ReadTSInfo(TSInfo& tsInfo)
-{
-    bool ret = false;
-    std::string table("TSINFO");
-    if (!IsTableEmpty(table)) {
-        DBLock();
-        sqlite3_prepare_v2(_dataBase, "SELECT * FROM TSINFO WHERE FREQUENCY = ? AND PROGRAM_NUMBER = ? ;", -1, &_stmt, nullptr);
-        sqlite3_bind_int(_stmt, 1, (int)tsInfo.frequency);
-        sqlite3_bind_int(_stmt, 2, (int)tsInfo.programNumber);
-
-        if (sqlite3_step(_stmt) == SQLITE_ROW) {
-            tsInfo.videoPid = (uint16_t)sqlite3_column_int(_stmt, 2);
-            tsInfo.videoCodec = (uint32_t)sqlite3_column_int(_stmt, 3);
-            tsInfo.videoPcrPid = (uint16_t)sqlite3_column_int(_stmt, 4);
-            tsInfo.audioPid = (uint16_t)sqlite3_column_int(_stmt, 5);
-            tsInfo.audioCodec = (uint32_t)sqlite3_column_int(_stmt, 6);
-            tsInfo.audioPcrPid = (uint16_t)sqlite3_column_int(_stmt, 7);
-            tsInfo.pmtPid  = (uint16_t)sqlite3_column_int(_stmt, 8);
-            ret = true;
-            TRACE(Trace::Information, (_T("Data read with freq = %u program num = %d videoPid = %d, \
-                videocodec=%d, videoPCRpid = %d, audioPid = %d , audiocodec=%d, \
-                AudioPCRPid = %d pmtpid =%d"), tsInfo.frequency, tsInfo.programNumber,
-                tsInfo.videoPid, tsInfo.videoCodec, tsInfo.videoPcrPid, tsInfo.audioPid, tsInfo.audioCodec, tsInfo.audioPcrPid, tsInfo.pmtPid));
-        }
-        sqlite3_finalize(_stmt);
-        DBUnlock();
-    }
-    return ret;
 }
 
 bool EPGDataBase::IsServicePresentInTSInfo(int32_t programNumber)

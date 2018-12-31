@@ -35,7 +35,7 @@ namespace Plugin {
     static void didStartProvisionalNavigation(WKPageRef page, WKNavigationRef navigation, WKTypeRef userData, const void* clientInfo);
     static void didFinishDocumentLoad(WKPageRef page, WKNavigationRef navigation, WKTypeRef userData, const void* clientInfo);
     static void onFrameDisplayed(WKViewRef view, const void* clientInfo);
-    //static void didSameDocumentNavigation(const OpaqueWKPage* page, const OpaqueWKNavigation* nav, unsigned int count, const void* clientInfo, const void* info);
+    static void didSameDocumentNavigation(const OpaqueWKPage* page, const OpaqueWKNavigation* nav, unsigned int count, const void* clientInfo, const void* info);
     static void requestClosure(const void* clientInfo);
     static void didRequestAutomationSession(WKContextRef context, WKStringRef sessionID, const void* clientInfo);
     static WKPageRef onAutomationSessionRequestNewPage(WKWebAutomationSessionRef session, const void* clientInfo);
@@ -62,14 +62,13 @@ namespace Plugin {
         nullptr, // didFailNavigation
         nullptr, // didFailProvisionalLoadInSubframe
         didFinishDocumentLoad,
-        nullptr, // didSameDocumentNavigation
+        didSameDocumentNavigation, // didSameDocumentNavigation
         nullptr, // renderingProgressDidChange
         nullptr, // canAuthenticateAgainstProtectionSpace
         nullptr, // didReceiveAuthenticationChallenge
         // webProcessDidCrash
         [](WKPageRef page, const void*) {
-         fprintf(stderr, "ERROR: WebProcess crashed: exiting ...\n");
-         fflush(stderr);
+         SYSLOG(Trace::Fatal, ("CRASH: WebProcess crashed, exiting..."));
          exit(1);
         },
         nullptr, // copyWebCryptoMasterKey
@@ -334,6 +333,10 @@ static GSourceFuncs _handlerIntervention =
                 , Automation(false)
                 , WebGLEnabled(true)
                 , ThreadedPainting()
+                , Width(1280)
+                , Height(720)
+                , PTSOffset(0)
+                , ScaleFactor(1.0)
             {
                 Add(_T("useragent"), &UserAgent);
                 Add(_T("url"), &URL);
@@ -365,6 +368,10 @@ static GSourceFuncs _handlerIntervention =
                 Add(_T("automation"), &Automation);
                 Add(_T("webgl"), &WebGLEnabled);
                 Add(_T("threadedpainting"), &ThreadedPainting);
+                Add(_T("width"), &Width);
+                Add(_T("height"), &Height);
+                Add(_T("ptsoffset"), &PTSOffset);
+                Add(_T("scalefactor"), &ScaleFactor);
             }
             ~Config()
             {
@@ -401,6 +408,10 @@ static GSourceFuncs _handlerIntervention =
             Core::JSON::Boolean Automation;
             Core::JSON::Boolean WebGLEnabled;
             Core::JSON::String ThreadedPainting;
+            Core::JSON::DecUInt16 Width;
+            Core::JSON::DecUInt16 Height;
+            Core::JSON::DecSInt16 PTSOffset;
+            Core::JSON::DecUInt16 ScaleFactor;
         };
 
     private:
@@ -422,7 +433,6 @@ static GSourceFuncs _handlerIntervention =
             , _state(PluginHost::IStateControl::UNINITIALIZED)
             , _hidden(false)
             , _time(0)
-            , _autoStart(false)
             , _compliant(false)    
             , _automationSession(nullptr)
         {
@@ -677,8 +687,6 @@ static GSourceFuncs _handlerIntervention =
                 _URL = _config.URL.Value();
             }
 
-            _autoStart = service->AutoStart();
-
             Core::SystemInfo::SetEnvironment(_T("QUEUEPLAYER_FLUSH_MODE"), _T("3"), false);
             Core::SystemInfo::SetEnvironment(_T("HOME"), service->PersistentPath());
 
@@ -708,8 +716,10 @@ static GSourceFuncs _handlerIntervention =
             // GStreamer on-disk buffering
             if (_config.MediaDiskCache.Value() == false)
                 Core::SystemInfo::SetEnvironment(_T("WPE_SHELL_DISABLE_MEDIA_DISK_CACHE"), _T("1"), !environmentOverride);
+            else
+                Core::SystemInfo::SetEnvironment(_T("WPE_SHELL_MEDIA_DISK_CACHE_PATH"), service->PersistentPath(), !environmentOverride);
 
-            // Disk Cache
+		// Disk Cache
             if (_config.DiskCache.Value().empty() == false)
                 Core::SystemInfo::SetEnvironment(_T("WPE_DISK_CACHE_SIZE"), _config.DiskCache.Value(), !environmentOverride);
 
@@ -773,6 +783,25 @@ static GSourceFuncs _handlerIntervention =
             // ThreadedPainting
             if (_config.ThreadedPainting.Value().empty() == false) {
                 Core::SystemInfo::SetEnvironment(_T("WEBKIT_NICOSIA_PAINTING_THREADS"), _config.ThreadedPainting.Value(), !environmentOverride);
+            }
+
+            // PTSOffset
+            if (_config.PTSOffset.IsSet() == true) {
+                string ptsoffset(Core::NumberType<int16_t>(_config.PTSOffset.Value()).Text());
+                Core::SystemInfo::SetEnvironment(_T("PTS_REPORTING_OFFSET_MS"), ptsoffset, !environmentOverride);
+            }
+
+            string width(Core::NumberType<uint16_t>(_config.Width.Value()).Text());
+            string height(Core::NumberType<uint16_t>(_config.Height.Value()).Text());
+            Core::SystemInfo::SetEnvironment(_T("WEBKIT_RESOLUTION_WIDTH"), width, !environmentOverride);
+            Core::SystemInfo::SetEnvironment(_T("WEBKIT_RESOLUTION_HEIGHT"), height, !environmentOverride);
+
+            if (width.empty() == false) {
+                Core::SystemInfo::SetEnvironment(_T("GST_VIRTUAL_DISP_WIDTH"), width, !environmentOverride);
+            }
+
+            if (height.empty() == false) {
+                Core::SystemInfo::SetEnvironment(_T("GST_VIRTUAL_DISP_HEIGHT"), height, !environmentOverride);
             }
 
             // Oke, so we are good to go.. Release....
@@ -1032,6 +1061,10 @@ static GSourceFuncs _handlerIntervention =
             _handlerInjectedBundle.base.clientInfo = static_cast<void*>(this);
             WKContextSetInjectedBundleClient(context, &_handlerInjectedBundle.base);
 
+            WKPageSetProxies(_page, nullptr);
+	
+            WKPageSetCustomBackingScaleFactor(_page, _config.ScaleFactor.Value());
+
             if (_config.Automation.Value()) {
                 _handlerAutomation.base.clientInfo = static_cast<void*>(this);
                 WKContextSetAutomationClient(context, &_handlerAutomation.base);
@@ -1046,7 +1079,7 @@ static GSourceFuncs _handlerIntervention =
 
             // Move into the correct state, as requested
             _adminLock.Lock();
-            if ((_state == PluginHost::IStateControl::SUSPENDED) || ((_autoStart == true) && (_state == PluginHost::IStateControl::UNINITIALIZED))) {
+            if ((_state == PluginHost::IStateControl::SUSPENDED) || (_state == PluginHost::IStateControl::UNINITIALIZED)) {
                 _state = PluginHost::IStateControl::UNINITIALIZED;
                 Suspend();
             }
@@ -1094,7 +1127,6 @@ static GSourceFuncs _handlerIntervention =
         PluginHost::IStateControl::state _state;
         bool _hidden;
         uint64_t _time;
-        bool _autoStart;
         bool _compliant;
         WKWebAutomationSessionRef _automationSession;
     };
@@ -1142,8 +1174,8 @@ static GSourceFuncs _handlerIntervention =
         WKRelease(urlStringRef);
     }
 
-    /* static void didSameDocumentNavigation(const OpaqueWKPage* page, const OpaqueWKNavigation* nav, WKSameDocumentNavigationType type, const void* clientInfo, const void* info) {
-
+    /* static */ void didSameDocumentNavigation(const OpaqueWKPage* page, const OpaqueWKNavigation* nav, WKSameDocumentNavigationType type, const void* clientInfo, const void* info)
+    {
         if (type == kWKSameDocumentNavigationAnchorNavigation) {
             WebKitImplementation* browser = const_cast<WebKitImplementation*>(static_cast<const WebKitImplementation*>(info));
 
@@ -1152,12 +1184,12 @@ static GSourceFuncs _handlerIntervention =
 
             string url = WebKit::Utils::WKStringToString(urlStringRef);
 
-            printf("didSameDocumentNavigation %s %d \n", url.c_str(), type);
             browser->OnURLChanged(url);
+
             WKRelease(urlRef);
             WKRelease(urlStringRef);
         }
-    } */
+    }
 
     /* static */ void didFinishDocumentLoad(WKPageRef page, WKNavigationRef navigation, WKTypeRef userData, const void* clientInfo)
     {
@@ -1254,7 +1286,7 @@ namespace WebKitBrowser {
         MemoryObserverImpl(const uint32_t id)
             : _main(id == 0 ? Core::ProcessInfo().Id() : id)
             , _children(_main.Id())
-            , _startTime()
+            , _startTime(Core::Time::Now().Ticks() + (TYPICAL_STARTUP_TIME * 1000000))
         { // IsOperation true till calculated time (microseconds)
         }
         ~MemoryObserverImpl()
@@ -1262,9 +1294,10 @@ namespace WebKitBrowser {
         }
 
     public:
-        virtual void Observe(const bool enable)
+        virtual void Observe(const uint32_t pid)
         {
-            if (enable == true) {
+            if (pid != 0) {
+                _main = Core::ProcessInfo(pid);
                 _startTime = Core::Time::Now().Ticks() + (TYPICAL_STARTUP_TIME * 1000000);
             }
             else {
@@ -1274,48 +1307,60 @@ namespace WebKitBrowser {
 
         virtual uint64_t Resident() const
         {
-            if (_children.Count() < 2) {
-                _children = Core::ProcessInfo::Iterator(_main.Id());
-            }
+            uint32_t result(0);
 
-            uint64_t result(_main.Resident());
+            if (_startTime != 0) {
+                if (_children.Count() < 2) {
+                    _children = Core::ProcessInfo::Iterator(_main.Id());
+                }
 
-            _children.Reset();
+                result = _main.Resident();
 
-            while (_children.Next() == true) {
-                result += _children.Current().Resident();
+                _children.Reset();
+
+                while (_children.Next() == true) {
+                    result += _children.Current().Resident();
+                }
             }
 
             return (result);
         }
         virtual uint64_t Allocated() const
         {
-            if (_children.Count() < 2) {
-                _children = Core::ProcessInfo::Iterator(_main.Id());
-            }
+            uint32_t result(0);
 
-            uint64_t result(_main.Allocated());
+            if (_startTime != 0) {
+                if (_children.Count() < 2) {
+                    _children = Core::ProcessInfo::Iterator(_main.Id());
+                }
 
-            _children.Reset();
+                result = _main.Allocated();
 
-            while (_children.Next() == true) {
-                result += _children.Current().Allocated();
+                _children.Reset();
+
+                while (_children.Next() == true) {
+                    result += _children.Current().Allocated();
+                }
             }
 
             return (result);
         }
         virtual uint64_t Shared() const
         {
-            if (_children.Count() < 2) {
-                _children = Core::ProcessInfo::Iterator(_main.Id());
-            }
+            uint32_t result(0);
 
-            uint64_t result(_main.Shared());
+            if (_startTime != 0) {
+                if (_children.Count() < 2) {
+                    _children = Core::ProcessInfo::Iterator(_main.Id());
+                }
 
-            _children.Reset();
+                result = _main.Shared();
 
-            while (_children.Next() == true) {
-                result += _children.Current().Shared();
+                _children.Reset();
+
+                while (_children.Next() == true) {
+                    result += _children.Current().Shared();
+                }
             }
 
             return (result);
@@ -1324,35 +1369,39 @@ namespace WebKitBrowser {
         {
             // Refresh the children list !!!
             _children = Core::ProcessInfo::Iterator(_main.Id());
-            return (1 + _children.Count());
+            return ((_startTime == 0) || (_main.IsActive() == true) ? 1 : 0) + _children.Count();
         }
         virtual const bool IsOperational() const
         {
-            const uint8_t requiredChildren = (sizeof(mandatoryProcesses) / sizeof(mandatoryProcesses[0]));
+            uint32_t requiredProcesses = 0;
 
-            //!< We can monitor a max of 32 processes, every mandatory process represents a bit in the requiredProcesses.
-            // In the end we check if all bits are 0, what means all mandatory processes are still running.
-            uint32_t requiredProcesses = (0xFFFFFFFF >> (32 - requiredChildren));
+            if (_startTime != 0) {
+                const uint8_t requiredChildren = (sizeof(mandatoryProcesses) / sizeof(mandatoryProcesses[0]));
 
-            //!< If there are less children than in the the mandatoryProcesses struct, we are done and return false.
-            if (_children.Count() >= requiredChildren) {
+                //!< We can monitor a max of 32 processes, every mandatory process represents a bit in the requiredProcesses.
+                // In the end we check if all bits are 0, what means all mandatory processes are still running.
+                requiredProcesses = (0xFFFFFFFF >> (32 - requiredChildren));
 
-                _children.Reset();
+                //!< If there are less children than in the the mandatoryProcesses struct, we are done and return false.
+                if (_children.Count() >= requiredChildren) {
 
-                //!< loop over all child processes as long as we are operational.
-                while ((requiredProcesses != 0) && (true == _children.Next())) {
+                    _children.Reset();
 
-                    uint8_t count(0);
-                    string name(_children.Current().Name());
+                    //!< loop over all child processes as long as we are operational.
+                    while ((requiredProcesses != 0) && (true == _children.Next())) {
 
-                    while ((count < requiredChildren) && (name != mandatoryProcesses[count])) {
-                        ++count;
-                    }
+                        uint8_t count(0);
+                        string name(_children.Current().Name());
 
-                    //<! this is a mandatory process and if its still active reset its bit in requiredProcesses.
-                    //   If not we are not completely operational.
-                    if ((count < requiredChildren) && (_children.Current().IsActive() == true)) {
-                        requiredProcesses &= (~(1 << count));
+                        while ((count < requiredChildren) && (name != mandatoryProcesses[count])) {
+                            ++count;
+                        }
+
+                        //<! this is a mandatory process and if its still active reset its bit in requiredProcesses.
+                        //   If not we are not completely operational.
+                        if ((count < requiredChildren) && (_children.Current().IsActive() == true)) {
+                            requiredProcesses &= (~(1 << count));
+                        }
                     }
                 }
             }

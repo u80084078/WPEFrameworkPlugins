@@ -13,6 +13,8 @@
 
 #include "CENCParser.h"
 
+#include <ocdm/open_cdm.h>
+
 extern "C" {
 
 typedef ::CDMi::ISystemFactory* (*GetDRMSystemFunction)();
@@ -42,138 +44,36 @@ namespace Plugin {
             ExternalAccess(const ExternalAccess &) = delete;
             ExternalAccess & operator=(const ExternalAccess &) = delete;
 
-            class RequestHandler : public Core::IPCServerType<RPC::InvokeMessage>, public Core::Thread
-            {
-            private:
-                struct Info
-                {
-                    Core::ProxyType<RPC::InvokeMessage> message;
-                    Core::ProxyType<Core::IPCChannel> channel;
-                };
-                typedef Core::QueueType<Info> MessageQueue;
-
-                RequestHandler(const RequestHandler &) = delete;
-                RequestHandler & operator=(const RequestHandler &) = delete;
-
-            public:
-                RequestHandler()
-                    : Core::IPCServerType<RPC::InvokeMessage>(), Core::Thread(), _handleQueue(64),
-                      _handler(RPC::Administrator::Instance())
-                {
-                    Run();
-                }
-
-                ~RequestHandler()
-                {
-                    Thread::Stop();
-                    _handleQueue.Disable();
-                    Thread::Wait(Thread::BLOCKED | Thread::STOPPED, Core::infinite);
-                 }
-
-            public:
-                virtual void Procedure(Core::IPCChannel & channel, Core::ProxyType<RPC::InvokeMessage> & data)
-                {
-                    // Oke, see if we can reference count the IPCChannel
-                    Info newElement;
-                    newElement.channel = Core::ProxyType<Core::IPCChannel>(channel);
-                    newElement.message = data;
-
-                    ASSERT(newElement.channel.IsValid() == true);
-
-                    _handleQueue.Insert(newElement, Core::infinite);
-                }
-
-                virtual uint32_t Worker()
-                {
-                    Info newRequest;
-
-                    while (_handleQueue.Extract(newRequest, Core::infinite) == true)
-                    {
-
-                        _handler.Invoke(newRequest.channel, newRequest.message);
-
-                        Core::ProxyType<Core::IIPC> message(newRequest.message);
-                        newRequest.channel->ReportResponse(message);
-                    }
-
-                    return (Core::infinite);
-                }
-
-            private:
-                MessageQueue _handleQueue;
-                RPC::Administrator & _handler;
-            };
-
-            class ObjectMessageHandler : public Core::IPCServerType<RPC::ObjectMessage>
-            {
-            private:
-                ObjectMessageHandler() = delete;
-                ObjectMessageHandler(const ObjectMessageHandler &) = delete;
-                ObjectMessageHandler & operator=(const ObjectMessageHandler &) = delete;
-
-            public:
-                ObjectMessageHandler(::OCDM::IAccessorOCDM* parentInterface)
-                    : _parentInterface(parentInterface)
-                {
-                }
-                ~ObjectMessageHandler()
-                {
-                }
-
-            public:
-                virtual void Procedure(Core::IPCChannel & channel, Core::ProxyType<RPC::ObjectMessage> & data)
-                {
-                    // Oke, see if we can reference count the IPCChannel
-                    Core::ProxyType<Core::IPCChannel> refChannel(channel);
-
-                    ASSERT(refChannel.IsValid());
- 
-                    if (refChannel.IsValid() == true)
-                    {
-                        const uint32_t interfaceId(data->Parameters().InterfaceId());
-                        const uint32_t versionId(data->Parameters().VersionId());
-
-                        // Currently we only support version 1 of the IRPCLink :-)
-                        if (((versionId == 1) || (versionId == static_cast<uint32_t>(~0))) &&
-                            (interfaceId == ::OCDM::IAccessorOCDM::ID)) {
-                            // Reference count our parent
-                            _parentInterface->AddRef();
-
-                            // Allright, respond with the interface.
-                            data->Response().Value(_parentInterface);
-                        }
-                        else {
-                            // Allright, respond with the interface.
-                            data->Response().Value(nullptr);
-                         }
-                    }
-
-                    Core::ProxyType<Core::IIPC> returnValue(data);
-                    channel.ReportResponse(returnValue);
-                }
-
-            private:
-                ::OCDM::IAccessorOCDM* _parentInterface;
-            };
-
         public:
             ExternalAccess(const Core::NodeId & source, ::OCDM::IAccessorOCDM* parentInterface)
-                : RPC::Communicator(source, Core::ProxyType<RequestHandler>::Create())
-                , _handler(Core::ProxyType<ObjectMessageHandler>::Create(parentInterface))
+                : RPC::Communicator(source, Core::ProxyType< RPC::InvokeServerType<4, 1> >::Create(), _T(""))
+		, _parentInterface(parentInterface)
             {
-                RPC::Communicator::CreateFactory<RPC::ObjectMessage>(1);
-                RPC::Communicator::Register(_handler);
+		Open(Core::infinite);
             }
-
             ~ExternalAccess()
             {
                 Close(Core::infinite);
-                RPC::Communicator::Unregister(_handler);
-                RPC::Communicator::DestroyFactory<RPC::ObjectMessage>();
             }
 
+		private:
+			virtual void* Aquire(const string& className, const uint32_t interfaceId, const uint32_t versionId) {
+				void* result = nullptr;
+
+				// Currently we only support version 1 of the IRPCLink :-)
+				if (((versionId == 1) || (versionId == static_cast<uint32_t>(~0))) &&
+					((interfaceId == ::OCDM::IAccessorOCDM::ID) || (interfaceId == Core::IUnknown::ID))) {
+					// Reference count our parent
+					_parentInterface->AddRef();
+
+					// Allright, respond with the interface.
+					result = _parentInterface;
+				}
+				return (result);
+			}
+
         private:
-            Core::ProxyType<ObjectMessageHandler> _handler;
+		::OCDM::IAccessorOCDM* _parentInterface;
         };
 
         class AccessorOCDM : public ::OCDM::IAccessorOCDM {
@@ -302,9 +202,11 @@ namespace Plugin {
                             uint32_t clearContentSize = 0;
                             uint8_t* clearContent = nullptr;
 
-                            RequestConsume(WPEFramework::Core::infinite);
+                            RequestConsume(Core::infinite);
 
                             if (IsRunning() == true) {
+                                uint8_t keyIdLength = 0;
+				const uint8_t* keyIdData = KeyId(keyIdLength);
                                 int cr = _mediaKeys->Decrypt(
                                     _sessionKey,
                                     _sessionKeyLength,
@@ -315,7 +217,9 @@ namespace Plugin {
                                     Buffer(),
                                     BytesWritten(),
                                     &clearContentSize,
-                                    &clearContent);
+                                    &clearContent,
+                                    keyIdLength,
+                                    keyIdData);
 
                                 if ((cr == 0) && (clearContentSize != 0)) {
                                     if (clearContentSize != BytesWritten()) {
@@ -326,6 +230,12 @@ namespace Plugin {
                                     // Adjust the buffer on our sied (this process) on what we will write back
                                     SetBuffer(0, clearContentSize, clearContent);
                                 }
+
+                                // Store the status we have for the other side.
+                                Status(static_cast<uint32_t>(cr));
+
+                                // Store the status we have for the other side.
+                                Status(static_cast<uint32_t>(cr));
 
                                 // Whatever the result, we are done with the buffer..
                                 Consumed();
@@ -439,8 +349,7 @@ namespace Plugin {
                     , _mediaKeySession(mediaKeySession)
                     , _sink(this, callback)
                     , _buffer(new DataExchange(mediaKeySession, bufferName, defaultSize))
-                    , _cencData(*sessionData)
-                    , _observers() {
+                    , _cencData(*sessionData) {
 
                     ASSERT (parent != nullptr);
                     ASSERT (sessionData != nullptr);
@@ -470,7 +379,7 @@ namespace Plugin {
                 inline bool HasKeyId(const uint8_t keyId[]) {
                     return (_cencData.HasKeyId(keyId));
                 }
-                const std::string& SessionId() const {
+                virtual std::string SessionId() const override {
                     return (_sessionId);
                 }
 
@@ -507,41 +416,6 @@ namespace Plugin {
                     _mediaKeySession->Close();
                 }
 
-                virtual void Register (::OCDM::ISession::IKeyCallback* callback) override {
-
-                    _adminLock.Lock();
-
-                    ASSERT (std::find(_observers.begin(), _observers.end(), callback) == _observers.end());
-
-                    callback->AddRef();
-
-                    _observers.push_back(callback);
-
-                    // Give them the full list, of KeyIds we got now wit the status..
-                    CommonEncryptionData::Iterator index(_cencData.Keys());
-
-                    while (index.Next() == true) {
-                        const CommonEncryptionData::KeyId& entry (index.Current());
-                        callback->StateChange(entry.Length(), entry.Id(), entry.Status());
-                    }
-
-                    _adminLock.Unlock();
-                }
-
-                virtual void Unregister (::OCDM::ISession::IKeyCallback* callback) override {
-
-                    _adminLock.Lock();
-
-                    std::list<::OCDM::ISession::IKeyCallback*>::iterator  index (std::find(_observers.begin(), _observers.end(), callback));
-
-                    if (index != _observers.end()) {
-                        (*index)->Release();
-                        _observers.erase(index);
-                    }
-
-                    _adminLock.Unlock();
-                }
-
                 virtual void Revoke(OCDM::ISession::ICallback* callback) override {
                     _sink.Revoke (callback);
                 }
@@ -549,6 +423,21 @@ namespace Plugin {
                 BEGIN_INTERFACE_MAP(Session)
                     INTERFACE_ENTRY(::OCDM::ISession)
                 END_INTERFACE_MAP
+
+                void ReportKeyIds(::OCDM::IAccessorOCDM::INotification* callback) const {
+
+                    _adminLock.Lock();
+
+                    // Give them the full list, of KeyIds we got now wit the status..
+                    CommonEncryptionData::Iterator index(_cencData.Keys());
+
+                    while (index.Next() == true) {
+                        const CommonEncryptionData::KeyId& entry (index.Current());
+                        callback->KeyChange(_sessionId, entry.Id(), entry.Length(), entry.Status());
+                    }
+
+                    _adminLock.Unlock();
+                }
 
             private:
                 inline void UpdateKeyStatus(::OCDM::ISession::KeyStatus status, const uint8_t* buffer, const uint8_t length) {
@@ -559,32 +448,25 @@ namespace Plugin {
                         keyId = CommonEncryptionData::KeyId(CommonEncryptionData::COMMON, buffer, length);
                     }
 
-                    _adminLock.Lock();
-
                     const CommonEncryptionData::KeyId* updated = _cencData.UpdateKeyStatus(status, keyId);
 
                     if (updated != nullptr) {
-                        std::list<::OCDM::ISession::IKeyCallback*>::const_iterator index (_observers.begin());
                         const uint8_t length = updated->Length();
                         const uint8_t* id = updated->Id();
 
                         TRACE_L1("Reporting a new status for a KeyId. New state: %d", status);
 
-                        while (index != _observers.end()) {
-                            (*index)->StateChange(length, id, status);
-                            index++;
-                        }
+                        _parent.ReportKeyChange(_sessionId, id, length, status);
                     }
                     else {
                         TRACE(Trace::Information, ("There was no key to update !!!"));
                     }
                     
-                    _adminLock.Unlock();
                 }
 
             private:
                 AccessorOCDM& _parent;
-                Core::CriticalSection _adminLock;
+                mutable Core::CriticalSection _adminLock;
                 mutable uint32_t _refCount;
                 std::string _keySystem;
                 std::string _sessionId;
@@ -592,7 +474,6 @@ namespace Plugin {
                 Core::Sink<Sink> _sink;
                 DataExchange* _buffer;
                 CommonEncryptionData _cencData;
-                std::list<::OCDM::ISession::IKeyCallback*> _observers;
             };
  
         public:
@@ -601,7 +482,8 @@ namespace Plugin {
                 , _adminLock()
                 , _administrator(name)
                 , _defaultSize(defaultSize)
-                , _sessionList() {
+                , _sessionList() 
+                , _observers() {
                 ASSERT (parent != nullptr);
             }
             virtual ~AccessorOCDM() {
@@ -710,6 +592,7 @@ namespace Plugin {
                                 _adminLock.Lock();
 
                                 _sessionList.push_front(newEntry);
+                                ReportCreate(sessionId);
 
                                 _adminLock.Unlock();
                             }
@@ -747,11 +630,69 @@ namespace Plugin {
 		return (0);
             }
 
+            virtual void Register (::OCDM::IAccessorOCDM::INotification* callback) override {
+
+                _adminLock.Lock();
+
+                ASSERT (std::find(_observers.begin(), _observers.end(), callback) == _observers.end());
+
+                callback->AddRef();
+
+                _observers.push_back(callback);
+
+                std::list<SessionImplementation*>::const_iterator index (_sessionList.begin());
+                while (index != _sessionList.end()) { 
+                    (*index)->ReportKeyIds(callback);
+                    index++; 
+                }
+
+ 
+                _adminLock.Unlock();
+            }
+
+            virtual void Unregister (::OCDM::IAccessorOCDM::INotification* callback) override {
+
+                _adminLock.Lock();
+
+                std::list<::OCDM::IAccessorOCDM::INotification*>::iterator  index (std::find(_observers.begin(), _observers.end(), callback));
+
+                if (index != _observers.end()) {
+                    (*index)->Release();
+                    _observers.erase(index);
+                }
+
+                _adminLock.Unlock();
+            }
+ 
             BEGIN_INTERFACE_MAP(AccessorOCDM)
                 INTERFACE_ENTRY(::OCDM::IAccessorOCDM)
             END_INTERFACE_MAP
 
         private:
+            void ReportCreate(const string& sessionId) {
+                std::list<::OCDM::IAccessorOCDM::INotification*>::iterator  index (_observers.begin());
+                while (index != _observers.end()) {
+                    (*index)->Create(sessionId);
+                    index++;
+                }
+            }
+            void ReportDestroy(const string& sessionId) {
+                std::list<::OCDM::IAccessorOCDM::INotification*>::iterator  index (_observers.begin());
+                while (index != _observers.end()) {
+                    (*index)->Destroy(sessionId);
+                    index++;
+                }
+            }
+            void ReportKeyChange(const string& sessionId, const uint8_t keyId[], const uint8_t length, const OCDM::ISession::KeyStatus status) {
+                _adminLock.Lock();
+                std::list<::OCDM::IAccessorOCDM::INotification*>::iterator  index (_observers.begin());
+                while (index != _observers.end()) {
+                    (*index)->KeyChange(sessionId, keyId, length, status);
+                    index++;
+                }
+                
+                _adminLock.Unlock();
+            }
             ::OCDM::ISession* FindSession (const CommonEncryptionData& keyIds, const string& keySystem) const {
                 ::OCDM::ISession* result = nullptr;
 
@@ -797,8 +738,10 @@ namespace Plugin {
                     ASSERT (index != _sessionList.end());
                 
                     if (index != _sessionList.end()) {
+                        const string sessionId(session->SessionId());
 	                // Before we remove it here, release it.
                         _sessionList.erase(index);
+                        ReportDestroy(sessionId);
                     }
                 }
 
@@ -812,7 +755,10 @@ namespace Plugin {
             BufferAdministrator _administrator;
             uint32_t _defaultSize;
             std::list<SessionImplementation*> _sessionList;
+            std::list<::OCDM::IAccessorOCDM::INotification*> _observers;
         };
+
+
 
         class Config : public Core::JSON::Container {
         private:
@@ -820,29 +766,36 @@ namespace Plugin {
             Config& operator=(const Config&);
 
         public: 
-            class Link : public Core::JSON::Container {
+            class Systems : public Core::JSON::Container {
             private:
-                Link& operator= (const Link&);
+                Systems& operator= (const Systems&);
 
             public:
-                Link () 
-                    : Key()
-                    , System(){
-                    Add("key", &Key);
-                    Add("system", &System);
+                Systems () 
+                    : Core::JSON::Container()
+                    , Name()
+                    , Designators()
+                    , Configuration() {
+                    Add("name", &Name);
+                    Add("designators", &Designators);
+                    Add("configuration", &Configuration);
                 }
-                Link (const Link& copy) 
-                    : Key(copy.Key)
-                    , System(copy.System){
-                    Add("key", &Key);
-                    Add("system", &System);
+                Systems (const Systems& copy) 
+                    : Core::JSON::Container()
+                    , Name(copy.Name)
+                    , Designators(copy.Designators)
+                    , Configuration(copy.Configuration) {
+                    Add("name", &Name);
+                    Add("designators", &Designators);
+                    Add("configuration", &Configuration);
                 }
-                virtual ~Link() {
-                }
+                
+                virtual ~Systems() = default;
 
             public:
-                Core::JSON::String Key;
-                Core::JSON::String System;
+                Core::JSON::String Name;
+                Core::JSON::ArrayType<Core::JSON::String> Designators;
+                Core::JSON::String Configuration;
             };
 
         public:
@@ -852,13 +805,13 @@ namespace Plugin {
                 , Connector(_T("/tmp/ocdm"))
                 , SharePath(_T("/tmp"))
                 , ShareSize(8 * 1024)
-                , Mapping()
+                , KeySystems()
             {
                 Add(_T("location"), &Location);
                 Add(_T("connector"), &Connector);
                 Add(_T("sharepath"), &SharePath);
                 Add(_T("sharesize"), &ShareSize);
-                Add(_T("mapping"), &Mapping);
+                Add(_T("systems"), &KeySystems);
             }
             ~Config()
             {
@@ -869,7 +822,7 @@ namespace Plugin {
             Core::JSON::String Connector;
             Core::JSON::String SharePath;
             Core::JSON::DecUInt32 ShareSize;
-            Core::JSON::ArrayType<Link> Mapping;
+            Core::JSON::ArrayType<Systems> KeySystems;
         };
 
     public:
@@ -936,30 +889,48 @@ namespace Plugin {
                         }
                     }
                 }
-            }
-
-            Core::JSON::ArrayType< Config::Link >::ConstIterator index (static_cast<const Config&>(config).Mapping.Elements());
-
-            while (index.Next () == true) {
-
-                const string system (index.Current().System.Value());
-
-                if ( (system.empty() == false) && (index.Current().Key.Value().empty() == false) ) {
-                    // Find a factory for the key system:
-                    std::map<const string, SystemFactory>::iterator factory (factories.find(system));
-
-                    if (factory != factories.end()) {
-                        // Register this handler
-                        _systemToFactory.insert(std::pair<const std::string, SystemFactory>(index.Current().Key.Value(), factory->second));
-                    }
-                    else {
-                        SYSLOG(PluginHost::Startup, (_T("Required factory [%s], not found for [%s]"), system.c_str(), index.Current().Key.Value().c_str()));
-                    }
+                else {
+                    SYSLOG(Logging::Startup, (_T("Could not load factory [%s], error [%s]"), Core::File::FileNameExtended(entry.Current()).c_str(), library.Error().c_str()));
                 }
             }
 
+            Core::JSON::ArrayType< Config::Systems >::ConstIterator index (static_cast<const Config&>(config).KeySystems.Elements());
+
+            while (index.Next () == true) {
+
+                const string system (index.Current().Name.Value());
+
+                if ( (system.empty() == false) && (index.Current().Designators.IsSet() == true) ) {
+                    Core::JSON::ArrayType< Core::JSON::String >::ConstIterator designators (static_cast<const Core::JSON::ArrayType< Core::JSON::String >&>( index.Current().Designators).Elements() );                   
+                    
+                    // Find a factory for the key system:
+                    std::map<const string, SystemFactory>::iterator factory (factories.find(system));
+                    
+                    while ( designators.Next() == true ) {
+                        const string designator( designators.Current().Value() );
+                        if ( designator.empty() == false )  {
+                            if( factory != factories.end() ) {
+                                _systemToFactory.insert(std::pair<const std::string, SystemFactory>(designator, factory->second));
+
+                            }
+                            else {
+                                SYSLOG(Logging::Startup, (_T("Required factory [%s], not found for [%s]"), system.c_str(), designator.c_str()));
+                            }
+                        }
+                    }
+
+                    //now handle the configiguration
+                    const string configuration( index.Current().Configuration.Value() );
+                    if( configuration.empty() == false && factory != factories.end() ) {
+
+                        factory->second.Factory->SystemConfig(configuration);
+                    }
+
+               }
+            }
+
             if (_systemToFactory.size() == 0) {
-                SYSLOG(PluginHost::Startup, (_T("No DRM factories specified. OCDM can not service any DRM requests.")));
+                SYSLOG(Logging::Startup, (_T("No DRM factories specified. OCDM can not service any DRM requests.")));
             }
 
             _entryPoint = Core::Service<AccessorOCDM>::Create<::OCDM::IAccessorOCDM>(this, config.SharePath.Value(), config.ShareSize.Value());
@@ -967,9 +938,7 @@ namespace Plugin {
 
             if (_service != nullptr) {
 
-                result = _service->Open(Core::infinite);
-
-                if (result != Core::ERROR_NONE) {
+                if (_service->IsListening() == false) {
                     delete _service;
                     _entryPoint->Release();
                     _service = nullptr;
@@ -978,11 +947,14 @@ namespace Plugin {
                 else {
                     if (subSystem != nullptr) {
 
+						// Announce the port on which we are listening
+						Core::SystemInfo::SetEnvironment(_T("OPEN_CDM_SERVER"), config.Connector.Value(), true);
+
                         ASSERT (subSystem->IsActive(PluginHost::ISubSystem::DECRYPTION) == false);
                         subSystem->Set(PluginHost::ISubSystem::DECRYPTION, this);
                     }
                     if (_systemToFactory.size() == 0) {
-                        SYSLOG(PluginHost::Startup, (string(_T("OCDM server has NO key systems registered!!!"))));
+                        SYSLOG(Logging::Startup, (string(_T("OCDM server has NO key systems registered!!!"))));
                     }
                 }
 
@@ -1092,8 +1064,11 @@ namespace Plugin {
         std::map<const std::string,SystemFactory> _systemToFactory;
         std::list<Core::Library> _systemLibraries;
         std::list<string> _keySystems;
+#ifdef _MSVC_LANG
+        void* _proxystubs;
+#endif
     };
 
     SERVICE_REGISTRATION(OCDMImplementation, 1, 0);
 
-} } /* namespace iWPEFramework::Plugin */
+} } /* namespace WPEFramework::Plugin */

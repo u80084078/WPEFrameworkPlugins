@@ -95,7 +95,7 @@ namespace Plugin {
 	Core::File dnsFile(_dnsFile, true);
         if (dnsFile.Exists() == false) {
             if (dnsFile.Create() == false) {
-                SYSLOG(PluginHost::Startup, (_T("Could not create DNS configuration file [%s]"), _dnsFile.c_str()));
+                SYSLOG(Logging::Startup, (_T("Could not create DNS configuration file [%s]"), _dnsFile.c_str()));
             }
             else {
                 dnsFile.Close();
@@ -123,7 +123,7 @@ namespace Plugin {
                 } while ( (retries-- != 0) && (adapter.IsValid() == false) );
  	
 		if (adapter.IsValid() == false) {
-                    SYSLOG(PluginHost::Startup, (_T("Interface [%s], not available"), interfaceName.c_str()));
+                    SYSLOG(Logging::Startup, (_T("Interface [%s], not available"), interfaceName.c_str()));
                 }
                 else {
 
@@ -139,15 +139,15 @@ namespace Plugin {
 
                     mode how (index.Current().Mode);
                     if (how == MANUAL) {
-                        SYSLOG(PluginHost::Startup, (_T("Interface [%s] activated, no IP associated"), interfaceName.c_str()));
+                        SYSLOG(Logging::Startup, (_T("Interface [%s] activated, no IP associated"), interfaceName.c_str()));
 		    }
 		    else {
 			if (how == DYNAMIC) {
-                            SYSLOG(PluginHost::Startup, (_T("Interface [%s] activated, DHCP request issued"), interfaceName.c_str()));
+                            SYSLOG(Logging::Startup, (_T("Interface [%s] activated, DHCP request issued"), interfaceName.c_str()));
                             Reload(interfaceName, true);
 			}
 			else {
-                            SYSLOG(PluginHost::Startup, (_T("Interface [%s] activated, static IP assigned"), interfaceName.c_str()));
+                            SYSLOG(Logging::Startup, (_T("Interface [%s] activated, static IP assigned"), interfaceName.c_str()));
                             Reload(interfaceName, false);
 			}
                     }
@@ -242,38 +242,43 @@ namespace Plugin {
 
             if (index.Next() == true) {
 
-
                 std::map<const string, StaticInfo>::iterator entry(_interfaces.find(index.Current().Text()));
 
-				if (entry != _interfaces.end()) {
+                if (entry != _interfaces.end()) {
+                    
+                    Core::ProxyType<Web::JSONBodyType<NetworkControl::Entry> > data(jsonGetNetworkFactory.Element());
 
-					Core::ProxyType<Web::JSONBodyType<NetworkControl::Entry> > data(jsonGetNetworkFactory.Element());
-					
-					entry->second.Store(*data);
-					data->Interface = entry->first;
+                    entry->second.Store(*data);
+                    data->Interface = entry->first;
 
-					result->Body(data);
-				}
-				else {
+                    result->Body(data);
+    
+                    result->ErrorCode = Web::STATUS_OK;
+                    result->Message = "OK";
+                }
+                else {
 					result->ErrorCode = Web::STATUS_NOT_FOUND;
 					result->Message = string(_T("Could not find interface: ")) + index.Current().Text();
-				}
+                }
             }
             else {
                 std::map<const string, StaticInfo>::iterator entry(_interfaces.begin());
 
-				Core::ProxyType<Web::JSONBodyType< Core::JSON::ArrayType< NetworkControl::Entry> > > data(jsonGetNetworksFactory.Element());
+                Core::ProxyType<Web::JSONBodyType< Core::JSON::ArrayType< NetworkControl::Entry> > > data(jsonGetNetworksFactory.Element());
 
                 while (entry != _interfaces.end()) {
 
-					Entry& newSlot = data->Add();
+                    Entry& newSlot = data->Add();
 
-					entry->second.Store(newSlot);
-					newSlot.Interface = entry->first;
-					entry++;
+                    entry->second.Store(newSlot);
+                    newSlot.Interface = entry->first;
+                    entry++;
                 }
-				result->Body(data);
-			}
+                result->Body(data);
+     
+                result->ErrorCode = Web::STATUS_OK;
+                result->Message = "OK";   
+            }
 
             _adminLock.Unlock();
         }
@@ -635,7 +640,7 @@ namespace Plugin {
             Core::DataElementFile file(_dnsFile, Core::DataElementFile::SHAREABLE|Core::DataElementFile::READABLE|Core::DataElementFile::WRITABLE);
 
             if (file.IsValid() == false) {
-                SYSLOG(PluginHost::Startup, (_T("DNS functionality could NOT be updated [%s]"), _dnsFile.c_str()));
+                SYSLOG(Logging::Startup, (_T("DNS functionality could NOT be updated [%s]"), _dnsFile.c_str()));
             }
             else {
                 string data ((_T("#++SECTION: ")) + _service->Callsign() + '\n');
@@ -694,7 +699,7 @@ namespace Plugin {
                 ::memcpy(&(file[offset]), data.c_str(), data.length());
                 file.Sync();
 
-                SYSLOG(PluginHost::Startup, (_T("DNS functionality updated [%s]"), _dnsFile.c_str()));
+                SYSLOG(Logging::Startup, (_T("DNS functionality updated [%s]"), _dnsFile.c_str()));
             }
         }
 

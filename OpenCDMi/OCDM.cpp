@@ -23,25 +23,31 @@ namespace OCDM {
             }
 
         public:
-            virtual void Observe(const bool enable)
+            virtual void Observe(const uint32_t pid)
             {
-                _observable = enable;
+                if (pid == 0) {
+                    _observable = false;
+                }
+                else {
+                    _observable = false;
+                    _main = Core::ProcessInfo(pid);
+                }
             }
             virtual uint64_t Resident() const
             {
-                return (_main.Resident());
+                return (_observable == false ? 0 : _main.Resident());
             }
             virtual uint64_t Allocated() const
             {
-                return (_main.Allocated());
+                return (_observable == false ? 0 : _main.Allocated());
             }
             virtual uint64_t Shared() const
             {
-                return (_main.Shared());
+                return (_observable == false ? 0 : _main.Shared());
             }
             virtual uint8_t Processes() const
             {
-                return (1);
+                return (IsOperational() ? 1 : 0);
             }
             virtual const bool IsOperational() const
             {
@@ -79,20 +85,14 @@ namespace Plugin {
 
         _pid = 0;
         _service = service;
-        _skipURL = _service->WebPrefix().length();
+        _skipURL = static_cast<uint8_t>(_service->WebPrefix().length());
         config.FromString(_service->ConfigLine());
 
         // Register the Process::Notification stuff. The Remote process might die before we get a
         // change to "register" the sink for these events !!! So do it ahead of instantiation.
         _service->Register(&_notification);
 
-        if (config.OutOfProcess.Value() == true) {
-
-            _opencdmi = _service->Instantiate<Exchange::IContentDecryption>(2000, _T("OCDMImplementation"), static_cast<uint32_t>(~0), _pid, _service->Locator());
-        }
-        else {
-            _opencdmi = Core::ServiceAdministrator::Instance().Instantiate<Exchange::IContentDecryption>(Core::Library(), _T("OCDMImplementation"), static_cast<uint32_t>(~0));
-        }
+        _opencdmi = _service->Root<Exchange::IContentDecryption>(_pid, 2000, _T("OCDMImplementation"));
 
         if (_opencdmi == nullptr) {
             message = _T("OCDM could not be instantiated.");
@@ -158,11 +158,11 @@ namespace Plugin {
         return (nullptr);
     }
 
-    /* virtual */ void OCDM::Inbound(WPEFramework::Web::Request& request)
+    /* virtual */ void OCDM::Inbound(Web::Request& request)
     {
     }
 
-    /* virtual */ Core::ProxyType<Web::Response> OCDM::Process(const WPEFramework::Web::Request& request)
+    /* virtual */ Core::ProxyType<Web::Response> OCDM::Process(const Web::Request& request)
     {
         ASSERT(_skipURL <= request.Path.length());
 

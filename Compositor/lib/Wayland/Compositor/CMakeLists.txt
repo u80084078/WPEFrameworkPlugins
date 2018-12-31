@@ -1,9 +1,9 @@
-set(target_name ${compositor_artefact})
+set(TARGET ${PLATFORM_COMPOSITOR})
 
-message("Setup ${target_name} v${VERSION}...")
+message("Setup ${TARGET} v${VERSION}...")
 
 # add the platformplugin library
-add_library(${target_name} Wayland.cpp)
+add_library(${TARGET} Wayland.cpp)
 
 find_package(WaylandServer REQUIRED)
 find_package(WaylandEGL REQUIRED)
@@ -11,42 +11,41 @@ find_package(Core REQUIRED)
 find_package(Plugins REQUIRED)
 find_package(EGL REQUIRED)
 
-#find_package(nexusserver)
-
-if (WPEFRAMEWORK_PLUGIN_COMPOSITOR_NXSERVER)
+if (PLUGIN_COMPOSITOR_NXSERVER)
+    add_definitions(-DENABLE_NXSERVER=1)
     find_package(Nexus REQUIRED)
     find_package(NXServer REQUIRED)
-    target_link_libraries(${target_name} PRIVATE nexus::nexusserver)
+    target_link_libraries(${TARGET} PRIVATE nexus::nexusserver)
 endif ()
 
-target_link_libraries(${target_name}
+target_link_libraries(${TARGET}
         PRIVATE
-        WPEFramework::Core
-        WPEFramework::Plugins
+        ${CORE_LIBRARIES}
+        ${PLUGINS_LIBRARIES}
         WAYLAND::SERVER
         WAYLAND::EGL
         EGL::EGL
         WPEFramework::WaylandEGLClient
         )
 
-set_target_properties(${target_name}
+set_target_properties(${TARGET}
         PROPERTIES
             DEFINE_SYMBOL WPEFRAMEWORK_PLATFORM_PLUGIN
         )
 
 find_package(Westeros)
 if(WESTEROS_FOUND)
-    target_sources(${target_name} PRIVATE Westeros.cpp)
-    target_link_libraries(${target_name} PRIVATE WESTEROS::SERVER)
+    target_sources(${TARGET} PRIVATE Westeros.cpp)
+    target_link_libraries(${TARGET} PRIVATE WESTEROS::SERVER)
 endif(WESTEROS_FOUND)
 
-if(WPEFRAMEWORK_PLUGIN_COMPOSITOR_VIRTUALINPUT)
+if(PLUGIN_COMPOSITOR_VIRTUALINPUT)
     find_package(VirtualInput REQUIRED)
-    target_link_libraries(${target_name} PRIVATE WPEFramework::VirtualInput)
-endif(WPEFRAMEWORK_PLUGIN_COMPOSITOR_VIRTUALINPUT)
+    target_link_libraries(${TARGET} PRIVATE ${VIRTUALINPUT_LIBRARIES})
+endif(PLUGIN_COMPOSITOR_VIRTUALINPUT)
 
 install(
-    TARGETS ${target_name}
-    DESTINATION ${CMAKE_INSTALL_PREFIX}/share/WPEFramework/Compositor
+    TARGETS ${TARGET}
+    DESTINATION ${CMAKE_INSTALL_PREFIX}/share/${NAMESPACE}/Compositor
 )
 
