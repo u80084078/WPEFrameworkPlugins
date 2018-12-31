@@ -20,7 +20,6 @@
 #define THREAD_EXIT_LIMIT               100
 #define A2DP_AUDIO_SINK                 "0000110b-0000-1000-8000-00805f9b34fb"
 #define ASOUNDRC_FILE                   "/root/.asoundrc"
-#define DEVICE_ID_LENGTH                26
 
 namespace WPEFramework {
 

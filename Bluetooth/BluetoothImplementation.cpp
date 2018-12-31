@@ -370,16 +370,18 @@ namespace Plugin {
         // Opening existing Asoundrc file.
         std::ifstream inFile(ASOUNDRC_FILE);
         if (inFile.is_open()) {
-            audioSinkText << inFile.rdbuf();
-            string audioSinkString = audioSinkText.str();
-            size_t position = audioSinkString.find("device");
-            if (position != std::string::npos) {
-                if (!_connected.empty())
-                    audioSinkString.replace(position, DEVICE_ID_LENGTH, "device \"" + _connected + "\"");
-                else
-                    audioSinkString.replace(position, DEVICE_ID_LENGTH, "device \"00:00:00:00:00:00\"");
-            } else
-                TRACE(Trace::Information, ("Device information not found in Asoundrc"));
+            string audioSinkString;
+            for (std::string line; getline(inFile, line);)
+            {
+                size_t position = line.find("device");
+                if (position != std::string::npos) {
+                    if (!_connected.empty()
+                        line.replace(position, line.length() - position, "device \"" + _connected + "\"");
+                    else
+                        line.replace(position, line.length() - position, "device \"00:00:00:00:00:00\"");
+                }
+                audioSinkString += (line + "\n");
+            }
 
             inFile.close();
 
@@ -389,7 +391,6 @@ namespace Plugin {
             outFile.close();
         } else
             TRACE(Trace::Information, ("File not found"));
-
 
         return true;
     }

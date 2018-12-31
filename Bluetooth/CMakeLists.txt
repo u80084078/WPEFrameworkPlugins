@@ -3,6 +3,7 @@ set(MODULE_NAME ${NAMESPACE}${PLUGIN_NAME})
 
 message("Setting up ${PLUGIN_NAME}")
 
+set(GLIB_FIND_COMPONENTS "gio" CACHE INTERNAL "")
 find_package(GLIB REQUIRED)
 find_package(DBUS REQUIRED)
 

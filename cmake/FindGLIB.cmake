@@ -84,6 +84,7 @@ endif ()
 # Additional Glib components.  We only look for libraries, as not all of them
 # have corresponding headers and all headers are installed alongside the main
 # glib ones.
+set(GLIB_FIND_COMPONENTS ${GLIB_FIND_COMPONENTS})
 foreach (_component ${GLIB_FIND_COMPONENTS})
     if (${_component} STREQUAL "gio")
         find_library(GLIB_GIO_LIBRARIES NAMES gio-2.0 HINTS ${_GLIB_LIBRARY_DIR})
